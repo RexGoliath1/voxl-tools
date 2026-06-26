@@ -1,0 +1,138 @@
+# voxl-tools
+
+Scripts and param profiles for VOXL2 / ModalAI drone configuration.
+
+## Workflow: transfer and apply a param profile
+
+```
+# 1. On Mac — push the profile to the drone
+scp params/brecourt_vio.params root@<DRONE_IP>:/tmp/
+
+# 2. Also push the apply script
+scp apply_params.py root@<DRONE_IP>:/tmp/
+
+# 3. SSH into drone and apply
+ssh root@<DRONE_IP>
+python3 /tmp/apply_params.py /tmp/brecourt_vio.params
+
+# 4. (Optional) dry-run first to preview what will be set
+python3 /tmp/apply_params.py /tmp/brecourt_vio.params --dry-run
+```
+
+## Workflow: capture a full param dump from a reference drone
+
+```bash
+# On drone
+px4-param show > /tmp/dump.params
+
+# On Mac — pull it
+scp root@<DRONE_IP>:/tmp/dump.params .
+```
+
+`px4-param show` output is not QGC format — it looks like:
+```
+x + EKF2_EV_CTRL [294,573] : 15
+```
+
+Use it as a human-readable reference to build or verify a profile file. The
+`.params` profile files in `params/` use the standard QGC tab-separated format
+that `apply_params.py` parses.
+
+## Param profiles
+
+| File | Description |
+|------|-------------|
+| `params/brecourt_vio.params` | VIO-primary indoor config (Brecourt production) |
+
+## Lessons learned
+
+### `px4-param` is a VOXL binary, not a standard PX4 tool
+
+`px4-param show` and `px4-param set` are installed by the `voxl-px4` package.
+Standard PX4 parameter tools (`px4-param` in the NuttX shell, or `pyserial`
+over MAVLink) are different. To read parameters without QGC:
+
+```bash
+px4-param show              # dump all parameters
+px4-param show EKF2_EV_CTRL # show one
+px4-param set EKF2_EV_CTRL 15
+```
+
+`voxl-configure-px4-params` is a writer, not a reader — it expects a `.params`
+or `.cal` file as input. Don't confuse it with `px4-param`.
+
+### Use `scp`, not `rsync`, for file transfer to/from VOXL2
+
+macOS ships `rsync` 2.6.9 (2006), which is incompatible with the newer rsync on
+OE Linux. It exits with error 11 / "unexpected end of file". Use `scp` instead:
+
+```bash
+# Copy file to drone
+scp file.txt root@<IP>:/tmp/
+
+# Copy directory to drone
+scp -r local_dir/ root@<IP>:/data/
+
+# Pull from drone
+scp root@<IP>:/tmp/file.txt .
+```
+
+### `systemctl enable` is required after `dpkg -i`
+
+Installing a `.deb` on VOXL2 does NOT automatically enable the service. After
+installing or upgrading any `voxl-*` service package:
+
+```bash
+systemctl enable voxl-<service>
+systemctl start voxl-<service>
+```
+
+Verify:
+```bash
+systemctl is-active voxl-<service>
+journalctl -u voxl-<service> -n 50
+```
+
+### DISTANCE_SENSOR data path on VOXL2
+
+`qrb5165-rangefinder-server` (VL53L1X, I2C bus 4) publishes `DISTANCE_SENSOR`
+MAVLink messages **directly to PX4** via UDP — it does not go through
+`voxl-mavlink-server`. The key config field is `id_for_mavlink: 0` in
+`/etc/modalai/qrb5165-rangefinder-server.conf`.
+
+`voxl-mavlink-server` handles the general MPA ↔ MAVLink bridge; the
+rangefinder is a separate direct path.
+
+### EKF2 VIO parameter reference
+
+| Parameter | Value | Meaning |
+|-----------|-------|---------|
+| `EKF2_EV_CTRL` | 15 | All EV fusion: horiz pos + vert pos + vel + yaw |
+| `EKF2_EV_CTRL` | 3 | Minimal: horiz + vert position only |
+| `EKF2_EV_CTRL` | 0 | VIO completely disabled |
+| `EKF2_GPS_CTRL` | 0 | GPS disabled (indoor VIO-only) |
+| `EKF2_HGT_REF` | 0 | Height from GPS |
+| `EKF2_HGT_REF` | 1 | Height from barometer |
+| `EKF2_HGT_REF` | 2 | Height from rangefinder |
+| `EKF2_HGT_REF` | 3 | Height from EV (VIO) |
+| `EKF2_MAG_TYPE` | 5 | No mag fusion (indoor) |
+
+Brecourt production config uses `EKF2_HGT_REF = 2` (rangefinder) with the
+VL53L1X (3m max range). When the drone exceeds 3m AGL the rangefinder drops
+out and EKF2 falls back to baro (`EKF2_BARO_CTRL = 1` must be set).
+
+### GCS connectivity — `voxl-mavlink-server`
+
+MAVLink UDP to GCS is configured in `/etc/modalai/voxl-mavlink-server.conf`.
+The field `secondary_static_gcs_ip` sets a static push target (e.g., Mac's IP
+on the LAN). Update it when the Mac's IP changes (DHCP):
+
+```bash
+# Replace old IP with new IP
+sed -i 's/"secondary_static_gcs_ip":.*"OLD"/"secondary_static_gcs_ip":\t"NEW"/' \
+    /etc/modalai/voxl-mavlink-server.conf
+
+systemctl restart voxl-mavlink-server
+```
+
+QGC default listen port is `14550`.
