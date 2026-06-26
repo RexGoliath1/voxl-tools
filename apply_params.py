@@ -42,13 +42,13 @@ def apply(params, dry_run=False):
             continue
         result = subprocess.run(
             ['px4-param', 'set', name, value],
-            capture_output=True, text=True
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE
         )
         if result.returncode == 0:
             print(f'  ok  {name} = {value}')
             ok += 1
         else:
-            err = result.stderr.strip() or result.stdout.strip()
+            err = (result.stderr or result.stdout).decode().strip()
             print(f'  ERR {name}: {err}')
             fail += 1
     return ok, fail

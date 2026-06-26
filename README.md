@@ -105,21 +105,89 @@ rangefinder is a separate direct path.
 
 ### EKF2 VIO parameter reference
 
-| Parameter | Value | Meaning |
-|-----------|-------|---------|
-| `EKF2_EV_CTRL` | 15 | All EV fusion: horiz pos + vert pos + vel + yaw |
-| `EKF2_EV_CTRL` | 3 | Minimal: horiz + vert position only |
-| `EKF2_EV_CTRL` | 0 | VIO completely disabled |
-| `EKF2_GPS_CTRL` | 0 | GPS disabled (indoor VIO-only) |
-| `EKF2_HGT_REF` | 0 | Height from GPS |
-| `EKF2_HGT_REF` | 1 | Height from barometer |
-| `EKF2_HGT_REF` | 2 | Height from rangefinder |
-| `EKF2_HGT_REF` | 3 | Height from EV (VIO) |
-| `EKF2_MAG_TYPE` | 5 | No mag fusion (indoor) |
+Verify the 10 params that define the VIO profile:
 
-Brecourt production config uses `EKF2_HGT_REF = 2` (rangefinder) with the
-VL53L1X (3m max range). When the drone exceeds 3m AGL the rangefinder drops
-out and EKF2 falls back to baro (`EKF2_BARO_CTRL = 1` must be set).
+```bash
+px4-param show | grep -E 'EKF2_EV_CTRL|EKF2_GPS_CTRL|EKF2_HGT_REF|EKF2_BARO_CTRL|EKF2_OF_CTRL|EKF2_EV_QMIN|EKF2_RNG_CTRL|EKF2_MAG_TYPE|SYS_HAS_GPS|SYS_HAS_MAG'
+```
+
+#### `EKF2_EV_CTRL` — External Vision fusion bitmask
+
+Controls which data from VIO (e.g. open-vins) is fused into EKF2.
+
+| Bit | Value | Fuses |
+|-----|-------|-------|
+| 0 | 1 | Horizontal position from EV |
+| 1 | 2 | Vertical position from EV |
+| 2 | 4 | Velocity from EV |
+| 3 | 8 | Yaw from EV |
+
+`15` = all bits set = fuse everything. `0` = VIO ignored entirely.
+`3` (bits 0+1) is the minimum useful value: horizontal + vertical position only.
+
+#### `EKF2_GPS_CTRL` — GPS fusion bitmask
+
+Same bitmask structure as EV_CTRL but for GPS. `15` = full GPS fusion (pos,
+vel, height, yaw). `0` = GPS completely off. For indoor VIO-only flight this
+must be `0` — GPS and VIO will conflict if both are fused simultaneously.
+
+#### `EKF2_HGT_REF` — Primary height reference
+
+Determines what sensor anchors D=0 in the local NED frame.
+
+| Value | Source |
+|-------|--------|
+| 0 | GPS |
+| 1 | Barometer |
+| 2 | Rangefinder |
+| 3 | EV (VIO) |
+
+Brecourt uses `2` (VL53L1X rangefinder, 3m max range). This means D=0 is
+ground level regardless of where VIO initialized — important for the
+`target_D` precision landing setpoint to mean what it says.
+
+When the rangefinder exceeds its range (>3m AGL), EKF2 falls back to the next
+available sensor. `EKF2_BARO_CTRL = 1` must be set to provide that fallback.
+
+#### `EKF2_BARO_CTRL` — Barometer fusion
+
+`1` = baro measurements fused into EKF2. With `EKF2_HGT_REF = 2`, baro is not
+the primary height source but acts as fallback when the rangefinder loses lock.
+`0` = baro completely ignored (leaves no height fallback if rangefinder drops).
+
+#### `EKF2_OF_CTRL` — Optical flow fusion
+
+`1` = fuse optical flow velocity measurements. The Starling 2 has a downward
+optical flow camera. Optical flow gives horizontal velocity from frame-to-frame
+pixel motion + rangefinder altitude, which helps EKF2 when VIO estimates are
+noisy or lagged.
+
+#### `EKF2_EV_QMIN` — Minimum EV quality threshold
+
+Range 0–100 (percent). EV measurements below this quality score are rejected.
+`1` ≈ accept everything (useful for open-vins which may report low confidence
+at startup). `16` (the default) rejects low-confidence VIO data — appropriate
+for a well-tuned system but can cause VIO to be ignored during initialization.
+
+#### `EKF2_RNG_CTRL` — Rangefinder control
+
+`0` = rangefinder not used by EKF2. `1` = rangefinder fused as a height source
+(complementary to `EKF2_HGT_REF`). Must be `1` when `EKF2_HGT_REF = 2`.
+
+#### `EKF2_MAG_TYPE` — Magnetometer fusion mode
+
+`0` = automatic (use mag when available). `5` = no mag fusion. Indoor flights
+disable mag because: (1) VIO provides yaw, (2) indoor magnetic fields are
+disturbed by motors, rebar, and electronics. Without a clean mag signal,
+fusing it degrades the yaw estimate rather than helping it.
+
+#### `SYS_HAS_GPS` / `SYS_HAS_MAG`
+
+Declares to PX4 whether the hardware has GPS/mag physically present.
+Setting to `0` suppresses preflight check failures for missing sensors and
+prevents PX4 from waiting for a GPS/mag lock that will never come. These are
+capability declarations, not fusion controls — set `EKF2_GPS_CTRL` and
+`EKF2_MAG_TYPE` to actually disable fusion.
 
 ### GCS connectivity — `voxl-mavlink-server`
 

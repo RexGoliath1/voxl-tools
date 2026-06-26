@@ -6,6 +6,9 @@
 #
 # Apply on drone: python3 apply_params.py brecourt_vio.params
 #
+# Verify after applying:
+#   px4-param show | grep -E 'EKF2_EV_CTRL|EKF2_GPS_CTRL|EKF2_HGT_REF|EKF2_BARO_CTRL|EKF2_OF_CTRL|EKF2_EV_QMIN|EKF2_RNG_CTRL|EKF2_MAG_TYPE|SYS_HAS_GPS|SYS_HAS_MAG'
+#
 # Vehicle-Id	Component-Id	Name	Value	Type
 1	1	EKF2_EV_CTRL	15	6
 1	1	EKF2_GPS_CTRL	0	6
