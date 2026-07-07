@@ -149,3 +149,28 @@ systemctl restart voxl-mavlink-server
 ```
 
 QGC default listen port is `14550`.
+
+### Pull Brecourt ROS logs from VOXL Docker
+
+If the Brecourt ROS Docker run wrote logs to a host-mounted volume, or if the
+Docker container still exists, pull ROS logs over SSH/SCP:
+
+```bash
+./pull_ros_logs.sh root@192.168.1.57
+```
+
+Default output:
+
+```text
+ros_logs/root_192.168.1.57/<ROS datetime log directories>
+```
+
+The default `auto` source first looks for saved host logs such as
+`*/brecourt/log/ros`, then falls back to copying from a `brecourt-ros2` Docker
+container. Useful overrides:
+
+```bash
+./pull_ros_logs.sh --source docker root@192.168.1.57
+./pull_ros_logs.sh --source host --remote-repo-dir /data/brecourt_tflite_tracker root@192.168.1.57
+./pull_ros_logs.sh --host-log-dir /root/brecourt/log/ros root@192.168.1.57
+```
