@@ -153,16 +153,16 @@ QGC default listen port is `14550`.
 ### Pull Brecourt ROS logs from VOXL Docker
 
 If the Brecourt ROS Docker run wrote logs to a host-mounted volume, or if the
-Docker container still exists, pull ROS logs over SSH/SCP:
+Docker container still exists, pull ROS logs over adb or SSH/SCP:
 
 ```bash
-./pull_ros_logs.sh root@192.168.1.57
+./pull_ros_logs.sh
 ```
 
 Default output:
 
 ```text
-ros_logs/root_192.168.1.57/<ROS datetime log directories>
+ros_logs/adb_<serial>/<ROS datetime log directories>
 ```
 
 The default `auto` source first looks for saved host logs such as
@@ -170,15 +170,8 @@ The default `auto` source first looks for saved host logs such as
 container. Useful overrides:
 
 ```bash
-./pull_ros_logs.sh --source docker root@192.168.1.57
-./pull_ros_logs.sh --source host --remote-repo-dir /data/brecourt_tflite_tracker root@192.168.1.57
-./pull_ros_logs.sh --host-log-dir /root/brecourt/log/ros root@192.168.1.57
-```
-
-If the drone is connected over USB to the current machine instead of reachable
-over SSH, use adb:
-
-```bash
-./pull_ros_logs_adb.sh
-./pull_ros_logs_adb.sh --serial d6da8cd6
+./pull_ros_logs.sh --serial d6da8cd6
+./pull_ros_logs.sh --scp 192.168.1.57
+./pull_ros_logs.sh --source docker
+./pull_ros_logs.sh --source host --remote-repo-dir /data/brecourt_tflite_tracker
 ```
