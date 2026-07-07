@@ -170,12 +170,14 @@ or SSH/SCP:
 Default output:
 
 ```text
-logs/adb_<serial>/<ROS datetime log directories>
+logs/adb_<serial>/<pull datetime>/ros/<ROS datetime log directories>
+logs/adb_<serial>/<pull datetime>/terminal/<run.sh terminal logs>
 ```
 
 The default `auto` source checks Starling paths such as `/home/root` and
 `/data`, then host-user paths under `$HOME`, then falls back to copying from a
-`brecourt-ros2` Docker container. Useful overrides:
+`brecourt-ros2` Docker container. When it finds `brecourt/log/ros`, it also
+pulls sibling `brecourt/log/terminal` logs from `run.sh`. Useful overrides:
 
 ```bash
 ./pull_tflite_ros_logs --serial d6da8cd6

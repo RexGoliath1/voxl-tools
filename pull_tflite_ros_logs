@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import os
 import re
 import shutil
@@ -364,17 +365,40 @@ def expand_paths(remote: Remote, paths: list[str]) -> list[str]:
     return list(dict.fromkeys(remote.expand_path(path) for path in paths))
 
 
+def parent_dir(path: str) -> str:
+    return path.rstrip("/").rsplit("/", 1)[0] or "/"
+
+
+def log_bundle_dirs(path: str) -> list[tuple[str, str]]:
+    clean = path.rstrip("/")
+    name = clean.rsplit("/", 1)[-1]
+    if name == "ros":
+        root = parent_dir(clean)
+        return [("ros", clean), ("terminal", f"{root}/terminal")]
+    if name == "terminal":
+        return [("terminal", clean)]
+    if name == "log":
+        return [("ros", f"{clean}/ros"), ("terminal", f"{clean}/terminal")]
+    return [(name, clean)]
+
+
+def pull_log_bundle(remote: Remote, name: str, path: str, dest: Path) -> bool:
+    copied = False
+    for local_name, remote_path in log_bundle_dirs(path):
+        if remote.exists_nonempty_dir(remote_path):
+            print(f"source={name}:{remote_path}", file=sys.stderr)
+            remote.copy_dir_to_local(remote_path, dest / local_name)
+            copied = True
+    return copied
+
+
 def pull_named_dirs(remote: Remote, name: str, dirs: list[str], roots: list[str], discover: bool, dest: Path) -> bool:
     for path in expand_paths(remote, dirs):
-        if remote.exists_nonempty_dir(path):
-            print(f"source={name}:{path}", file=sys.stderr)
-            remote.copy_dir_to_local(path, dest)
+        if pull_log_bundle(remote, name, path, dest):
             return True
     if discover:
         for path in remote.list_dirs(expand_paths(remote, roots), "*/brecourt/log/ros"):
-            if remote.exists_nonempty_dir(path):
-                print(f"source={name}:{path}", file=sys.stderr)
-                remote.copy_dir_to_local(path, dest)
+            if pull_log_bundle(remote, name, path, dest):
                 return True
     return False
 
@@ -423,7 +447,8 @@ def main(argv: list[str] | None = None) -> int:
         else:
             remote = AdbRemote(args.adb, args.serial)
             target = f"adb_{label(remote.serial)}"
-        dest = args.output_dir / target
+        stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+        dest = args.output_dir / target / stamp
         pull_logs(remote, args, dest)
         print(f"Copied ROS logs to: {dest}")
     except RuntimeError as exc:
