@@ -1,0 +1,373 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.10"
+# ///
+"""Pull Brecourt ROS logs from a VOXL/Starling over adb or SSH/SCP."""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+from dataclasses import dataclass, field
+from pathlib import Path
+
+
+DEFAULT_HOST_LOG_DIRS = [
+    "/root/brecourt_tflite_tracker/brecourt/log/ros",
+    "/home/root/brecourt_tflite_tracker/brecourt/log/ros",
+    "/data/brecourt_tflite_tracker/brecourt/log/ros",
+    "/data/brecourt/brecourt/log/ros",
+    "/home/gonk/git/Brecourt/brecourt_tflite_tracker/brecourt/log/ros",
+]
+DEFAULT_CONTAINER_LOG_DIRS = [
+    "/root/brecourt/log/ros",
+    "/root/.ros/log",
+]
+DISCOVERY_ROOTS = ["/data", "/root", "/home/root", "/home/gonk"]
+
+
+@dataclass
+class Args:
+    output_dir: Path
+    source: str
+    container: str | None
+    adb: str
+    serial: str | None
+    scp: str | None
+    no_discover: bool
+    host_log_dirs: list[str] = field(default_factory=list)
+    container_log_dirs: list[str] = field(default_factory=list)
+
+
+def run(
+    cmd: list[str],
+    *,
+    input_text: str | None = None,
+    check: bool = True,
+) -> subprocess.CompletedProcess[str]:
+    try:
+        result = subprocess.run(
+            cmd,
+            input=input_text,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError(f"{cmd[0]!r} was not found") from exc
+    if check and result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or f"exit code {result.returncode}"
+        raise RuntimeError(f"{' '.join(cmd)} failed: {detail}")
+    return result
+
+
+def run_bytes(cmd: list[str], *, check: bool = True) -> subprocess.CompletedProcess[bytes]:
+    try:
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except FileNotFoundError as exc:
+        raise RuntimeError(f"{cmd[0]!r} was not found") from exc
+    if check and result.returncode != 0:
+        detail = result.stderr.decode(errors="replace").strip() or result.stdout.decode(errors="replace").strip()
+        raise RuntimeError(f"{' '.join(cmd)} failed: {detail or f'exit code {result.returncode}'}")
+    return result
+
+
+def shell_quote(value: str) -> str:
+    return "'" + value.replace("'", "'\"'\"'") + "'"
+
+
+def label(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]", "_", value)
+
+
+def parse_args(argv: list[str]) -> Args:
+    parser = argparse.ArgumentParser(
+        description="Pull Brecourt ROS 2 logs from a VOXL/Starling. Defaults to adb; use --scp for SSH/SCP.",
+    )
+    parser.add_argument("--serial", help="adb serial. Optional when exactly one adb device is attached.")
+    parser.add_argument(
+        "--scp",
+        metavar="HOST",
+        help="Use SSH/SCP instead of adb. Plain host/IP defaults to root@HOST.",
+    )
+    parser.add_argument("--adb", default="adb", help="adb executable. Default: adb")
+    parser.add_argument("-o", "--output-dir", default="./ros_logs", type=Path)
+    parser.add_argument("-s", "--source", choices=("auto", "host", "docker"), default="auto")
+    parser.add_argument("-c", "--container", help="Docker container id/name. Default: newest brecourt-ros2 container.")
+    parser.add_argument("--host-log-dir", action="append", default=[], help="Host-side saved ROS log dir. Repeatable.")
+    parser.add_argument(
+        "--remote-repo-dir",
+        action="append",
+        default=[],
+        help="Add DIR/brecourt/log/ros as a host log candidate. Repeatable.",
+    )
+    parser.add_argument("--container-log-dir", action="append", default=[], help="Container ROS log dir. Repeatable.")
+    parser.add_argument("--no-discover", action="store_true", help="Do not search common remote roots for */brecourt/log/ros.")
+    ns = parser.parse_args(argv)
+
+    host_dirs = list(ns.host_log_dir)
+    host_dirs.extend(f"{repo.rstrip('/')}/brecourt/log/ros" for repo in ns.remote_repo_dir)
+    if not host_dirs:
+        host_dirs = list(DEFAULT_HOST_LOG_DIRS)
+
+    return Args(
+        output_dir=ns.output_dir,
+        source=ns.source,
+        container=ns.container,
+        adb=ns.adb,
+        serial=ns.serial,
+        scp=ns.scp,
+        no_discover=ns.no_discover,
+        host_log_dirs=host_dirs,
+        container_log_dirs=ns.container_log_dir or list(DEFAULT_CONTAINER_LOG_DIRS),
+    )
+
+
+class Remote:
+    def exists_nonempty_dir(self, path: str) -> bool:
+        raise NotImplementedError
+
+    def list_dirs(self, roots: list[str], path_suffix: str) -> list[str]:
+        raise NotImplementedError
+
+    def docker_ps(self, all_containers: bool) -> list[tuple[str, str, str]]:
+        raise NotImplementedError
+
+    def docker_env(self, container: str) -> dict[str, str]:
+        raise NotImplementedError
+
+    def copy_dir_to_local(self, remote_dir: str, local_dir: Path) -> None:
+        raise NotImplementedError
+
+    def copy_container_dir_to_local(self, container: str, remote_dir: str, local_dir: Path) -> bool:
+        raise NotImplementedError
+
+    def cleanup(self) -> None:
+        pass
+
+
+class AdbRemote(Remote):
+    def __init__(self, adb: str, serial: str | None):
+        self.adb = adb
+        self.serial = serial or self._select_single_device()
+        self.base = [adb, "-s", self.serial]
+
+    def _select_single_device(self) -> str:
+        if shutil.which(self.adb) is None:
+            raise RuntimeError(f"adb executable not found: {self.adb}")
+        run([self.adb, "start-server"])
+        devices_output = run([self.adb, "devices"]).stdout
+        devices = [
+            parts[0]
+            for line in devices_output.splitlines()[1:]
+            if (parts := line.split()) and len(parts) >= 2 and parts[1] == "device"
+        ]
+        if not devices:
+            raise RuntimeError("No ready adb device found.\n" + devices_output + "\nUse --scp <host> for SSH/SCP mode.")
+        if len(devices) > 1:
+            raise RuntimeError("Multiple adb devices are attached; rerun with --serial <serial>.\n" + devices_output)
+        return devices[0]
+
+    def shell(self, command: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+        return run(self.base + ["shell", command], check=check)
+
+    def exists_nonempty_dir(self, path: str) -> bool:
+        cmd = f"test -d {shell_quote(path)} && find {shell_quote(path)} -mindepth 1 -print -quit | grep -q ."
+        return self.shell(cmd, check=False).returncode == 0
+
+    def list_dirs(self, roots: list[str], path_suffix: str) -> list[str]:
+        quoted_roots = " ".join(shell_quote(root) for root in roots)
+        cmd = f"find {quoted_roots} -type d -path {shell_quote(path_suffix)} -print 2>/dev/null | sort -r"
+        result = self.shell(cmd, check=False)
+        return [line.strip("\r") for line in result.stdout.splitlines() if line.strip()]
+
+    def docker_ps(self, all_containers: bool) -> list[tuple[str, str, str]]:
+        all_flag = " -a" if all_containers else ""
+        result = self.shell(f"docker ps{all_flag} --format '{{{{.ID}}}} {{{{.Image}}}} {{{{.Names}}}}'", check=False)
+        return parse_docker_ps(result.stdout)
+
+    def docker_env(self, container: str) -> dict[str, str]:
+        cmd = f"docker inspect --format '{{{{range .Config.Env}}}}{{{{println .}}}}{{{{end}}}}' {shell_quote(container)}"
+        result = self.shell(cmd, check=False)
+        return parse_env(result.stdout)
+
+    def copy_dir_to_local(self, remote_dir: str, local_dir: Path) -> None:
+        local_dir.mkdir(parents=True, exist_ok=True)
+        result = run_bytes(self.base + ["exec-out", f"tar -C {shell_quote(remote_dir)} -czf - ."], check=False)
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr.decode(errors="replace").strip() or f"failed to tar {remote_dir}")
+        extract_tar_bytes(result.stdout, local_dir)
+
+    def copy_container_dir_to_local(self, container: str, remote_dir: str, local_dir: Path) -> bool:
+        tmp = f"/tmp/voxl_ros_logs_copy_{os.getpid()}"
+        script = (
+            f"rm -rf {shell_quote(tmp)} && mkdir -p {shell_quote(tmp)} && "
+            f"docker cp {shell_quote(container + ':' + remote_dir + '/.')} {shell_quote(tmp)} >/dev/null 2>&1 && "
+            f"find {shell_quote(tmp)} -mindepth 1 -print -quit | grep -q . && "
+            f"tar -C {shell_quote(tmp)} -czf - .; "
+            f"status=$?; rm -rf {shell_quote(tmp)}; exit $status"
+        )
+        result = run_bytes(self.base + ["exec-out", script], check=False)
+        if result.returncode != 0:
+            return False
+        local_dir.mkdir(parents=True, exist_ok=True)
+        extract_tar_bytes(result.stdout, local_dir)
+        return True
+
+
+class SshRemote(Remote):
+    def __init__(self, target: str):
+        self.target = target if "@" in target else f"root@{target}"
+
+    def ssh(self, command: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+        return run(["ssh", self.target, command], check=check)
+
+    def exists_nonempty_dir(self, path: str) -> bool:
+        cmd = f"test -d {shell_quote(path)} && find {shell_quote(path)} -mindepth 1 -print -quit | grep -q ."
+        return self.ssh(cmd, check=False).returncode == 0
+
+    def list_dirs(self, roots: list[str], path_suffix: str) -> list[str]:
+        quoted_roots = " ".join(shell_quote(root) for root in roots)
+        cmd = f"find {quoted_roots} -type d -path {shell_quote(path_suffix)} -print 2>/dev/null | sort -r"
+        result = self.ssh(cmd, check=False)
+        return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+    def docker_ps(self, all_containers: bool) -> list[tuple[str, str, str]]:
+        all_flag = " -a" if all_containers else ""
+        result = self.ssh(f"docker ps{all_flag} --format '{{{{.ID}}}} {{{{.Image}}}} {{{{.Names}}}}'", check=False)
+        return parse_docker_ps(result.stdout)
+
+    def docker_env(self, container: str) -> dict[str, str]:
+        cmd = f"docker inspect --format '{{{{range .Config.Env}}}}{{{{println .}}}}{{{{end}}}}' {shell_quote(container)}"
+        result = self.ssh(cmd, check=False)
+        return parse_env(result.stdout)
+
+    def copy_dir_to_local(self, remote_dir: str, local_dir: Path) -> None:
+        local_dir.mkdir(parents=True, exist_ok=True)
+        result = run_bytes(["ssh", self.target, f"tar -C {shell_quote(remote_dir)} -czf - ."], check=False)
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr.decode(errors="replace").strip() or f"failed to tar {remote_dir}")
+        extract_tar_bytes(result.stdout, local_dir)
+
+    def copy_container_dir_to_local(self, container: str, remote_dir: str, local_dir: Path) -> bool:
+        tmp = f"/tmp/voxl_ros_logs_copy_{os.getpid()}"
+        script = (
+            f"rm -rf {shell_quote(tmp)} && mkdir -p {shell_quote(tmp)} && "
+            f"docker cp {shell_quote(container + ':' + remote_dir + '/.')} {shell_quote(tmp)} >/dev/null 2>&1 && "
+            f"find {shell_quote(tmp)} -mindepth 1 -print -quit | grep -q . && "
+            f"tar -C {shell_quote(tmp)} -czf - .; "
+            f"status=$?; rm -rf {shell_quote(tmp)}; exit $status"
+        )
+        result = run_bytes(["ssh", self.target, script], check=False)
+        if result.returncode != 0:
+            return False
+        local_dir.mkdir(parents=True, exist_ok=True)
+        extract_tar_bytes(result.stdout, local_dir)
+        return True
+
+
+def parse_docker_ps(output: str) -> list[tuple[str, str, str]]:
+    rows = []
+    for line in output.splitlines():
+        parts = line.split(maxsplit=2)
+        if len(parts) >= 2:
+            rows.append((parts[0], parts[1], parts[2] if len(parts) == 3 else ""))
+    return rows
+
+
+def parse_env(output: str) -> dict[str, str]:
+    env = {}
+    for line in output.splitlines():
+        key, sep, value = line.partition("=")
+        if sep:
+            env[key] = value
+    return env
+
+
+def extract_tar_bytes(data: bytes, destination: Path) -> None:
+    with tempfile.NamedTemporaryFile(suffix=".tar.gz") as tmp:
+        tmp.write(data)
+        tmp.flush()
+        with tarfile.open(tmp.name, "r:gz") as tar:
+            tar.extractall(destination)
+
+
+def select_container(remote: Remote, requested: str | None) -> str | None:
+    if requested:
+        return requested
+    for all_containers in (False, True):
+        for cid, image, name in remote.docker_ps(all_containers):
+            if "brecourt-ros2" in image or "brecourt-ros2" in name:
+                return cid
+    return None
+
+
+def pull_host_logs(remote: Remote, args: Args, dest: Path) -> bool:
+    for path in args.host_log_dirs:
+        if remote.exists_nonempty_dir(path):
+            print(f"source=host:{path}", file=sys.stderr)
+            remote.copy_dir_to_local(path, dest)
+            return True
+    if not args.no_discover:
+        for path in remote.list_dirs(DISCOVERY_ROOTS, "*/brecourt/log/ros"):
+            if remote.exists_nonempty_dir(path):
+                print(f"source=host:{path}", file=sys.stderr)
+                remote.copy_dir_to_local(path, dest)
+                return True
+    return False
+
+
+def pull_docker_logs(remote: Remote, args: Args, dest: Path) -> bool:
+    container = select_container(remote, args.container)
+    if not container:
+        return False
+    candidates = []
+    ros_log_dir = remote.docker_env(container).get("ROS_LOG_DIR")
+    if ros_log_dir:
+        candidates.append(ros_log_dir)
+    candidates.extend(args.container_log_dirs)
+    for path in dict.fromkeys(candidates):
+        if remote.copy_container_dir_to_local(container, path, dest):
+            print(f"source=docker:{container}:{path}", file=sys.stderr)
+            return True
+    return False
+
+
+def pull_logs(remote: Remote, args: Args, dest: Path) -> None:
+    dest.mkdir(parents=True, exist_ok=True)
+    if args.source == "host":
+        if not pull_host_logs(remote, args, dest):
+            raise RuntimeError("no non-empty host-mounted ROS log directory found")
+    elif args.source == "docker":
+        if not pull_docker_logs(remote, args, dest):
+            raise RuntimeError("no non-empty ROS log directory found in Docker")
+    elif not pull_host_logs(remote, args, dest) and not pull_docker_logs(remote, args, dest):
+        raise RuntimeError("no ROS logs found in host-mounted paths or Docker")
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(sys.argv[1:] if argv is None else argv)
+    try:
+        if args.scp:
+            remote = SshRemote(args.scp)
+            target = label(remote.target)
+        else:
+            remote = AdbRemote(args.adb, args.serial)
+            target = f"adb_{label(remote.serial)}"
+        dest = args.output_dir / target
+        pull_logs(remote, args, dest)
+        print(f"Copied ROS logs to: {dest}")
+    except RuntimeError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
