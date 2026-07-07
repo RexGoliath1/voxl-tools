@@ -351,7 +351,7 @@ if ! "${adb_cmd[@]}" shell "$remote_command" >"$remote_output"; then
     exit 8
 fi
 
-remote_archive=$(tail -n 1 "$remote_output")
+remote_archive=$(tail -n 1 "$remote_output" | tr -d '\r')
 if [[ -z "$remote_archive" ]]; then
     "${adb_cmd[@]}" shell "rm -f $(quote "$remote_script")" >/dev/null 2>&1 || true
     echo "ERROR: adb remote did not report an archive path" >&2
