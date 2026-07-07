@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.10"
 # ///
-"""Pull Brecourt ROS logs from a VOXL/Starling over adb or SSH/SCP."""
+"""Pull Brecourt TFLite ROS logs from a VOXL/Starling over adb or SSH/SCP."""
 
 from __future__ import annotations
 
@@ -18,18 +18,22 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 
-DEFAULT_HOST_LOG_DIRS = [
-    "/root/brecourt_tflite_tracker/brecourt/log/ros",
+DEFAULT_STARLING_LOG_DIRS = [
     "/home/root/brecourt_tflite_tracker/brecourt/log/ros",
     "/data/brecourt_tflite_tracker/brecourt/log/ros",
     "/data/brecourt/brecourt/log/ros",
-    "/home/gonk/git/Brecourt/brecourt_tflite_tracker/brecourt/log/ros",
+]
+DEFAULT_HOST_LOG_DIRS = [
+    "$HOME/git/Brecourt/brecourt_tflite_tracker/brecourt/log/ros",
+    "$HOME/git/brecourt_tflite_tracker/brecourt/log/ros",
+    "$HOME/brecourt_tflite_tracker/brecourt/log/ros",
 ]
 DEFAULT_CONTAINER_LOG_DIRS = [
     "/root/brecourt/log/ros",
     "/root/.ros/log",
 ]
-DISCOVERY_ROOTS = ["/data", "/root", "/home/root", "/home/gonk"]
+STARLING_DISCOVERY_ROOTS = ["/data", "/home/root"]
+HOST_DISCOVERY_ROOTS = ["$HOME"]
 
 
 @dataclass
@@ -41,6 +45,7 @@ class Args:
     serial: str | None
     scp: str | None
     no_discover: bool
+    starling_log_dirs: list[str] = field(default_factory=list)
     host_log_dirs: list[str] = field(default_factory=list)
     container_log_dirs: list[str] = field(default_factory=list)
 
@@ -88,7 +93,7 @@ def label(value: str) -> str:
 
 def parse_args(argv: list[str]) -> Args:
     parser = argparse.ArgumentParser(
-        description="Pull Brecourt ROS 2 logs from a VOXL/Starling. Defaults to adb; use --scp for SSH/SCP.",
+        description="Pull Brecourt TFLite ROS 2 logs from a VOXL/Starling. Defaults to adb; use --scp for SSH/SCP.",
     )
     parser.add_argument("--serial", help="adb serial. Optional when exactly one adb device is attached.")
     parser.add_argument(
@@ -97,20 +102,29 @@ def parse_args(argv: list[str]) -> Args:
         help="Use SSH/SCP instead of adb. Plain host/IP defaults to root@HOST.",
     )
     parser.add_argument("--adb", default="adb", help="adb executable. Default: adb")
-    parser.add_argument("-o", "--output-dir", default="./ros_logs", type=Path)
-    parser.add_argument("-s", "--source", choices=("auto", "host", "docker"), default="auto")
+    parser.add_argument("-o", "--output-dir", default="./logs", type=Path)
+    parser.add_argument("-s", "--source", choices=("auto", "starling", "host", "docker"), default="auto")
     parser.add_argument("-c", "--container", help="Docker container id/name. Default: newest brecourt-ros2 container.")
-    parser.add_argument("--host-log-dir", action="append", default=[], help="Host-side saved ROS log dir. Repeatable.")
+    parser.add_argument("--starling-log-dir", action="append", default=[], help="Starling-side saved ROS log dir. Repeatable.")
+    parser.add_argument("--host-log-dir", action="append", default=[], help="Host-user saved ROS log dir. Repeatable.")
     parser.add_argument(
         "--remote-repo-dir",
         action="append",
         default=[],
         help="Add DIR/brecourt/log/ros as a host log candidate. Repeatable.",
     )
-    parser.add_argument("--container-log-dir", action="append", default=[], help="Container ROS log dir. Repeatable.")
+    parser.add_argument(
+        "--container-log-dir",
+        "--docker-log-dir",
+        dest="container_log_dir",
+        action="append",
+        default=[],
+        help="Docker container ROS log dir. Repeatable.",
+    )
     parser.add_argument("--no-discover", action="store_true", help="Do not search common remote roots for */brecourt/log/ros.")
     ns = parser.parse_args(argv)
 
+    starling_dirs = list(ns.starling_log_dir) or list(DEFAULT_STARLING_LOG_DIRS)
     host_dirs = list(ns.host_log_dir)
     host_dirs.extend(f"{repo.rstrip('/')}/brecourt/log/ros" for repo in ns.remote_repo_dir)
     if not host_dirs:
@@ -124,12 +138,36 @@ def parse_args(argv: list[str]) -> Args:
         serial=ns.serial,
         scp=ns.scp,
         no_discover=ns.no_discover,
+        starling_log_dirs=starling_dirs,
         host_log_dirs=host_dirs,
         container_log_dirs=ns.container_log_dir or list(DEFAULT_CONTAINER_LOG_DIRS),
     )
 
 
 class Remote:
+    _home_dir: str | None = None
+
+    def shell(self, command: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+        raise NotImplementedError
+
+    def home_dir(self) -> str:
+        if self._home_dir is None:
+            result = self.shell('printf "%s" "$HOME"', check=False)
+            self._home_dir = (result.stdout.strip() if result.returncode == 0 else "") or "/tmp"
+        return self._home_dir
+
+    def expand_path(self, path: str) -> str:
+        home = self.home_dir().rstrip("/")
+        if path == "$HOME" or path == "${HOME}" or path == "~":
+            return home
+        if path.startswith("$HOME/"):
+            return home + path[len("$HOME") :]
+        if path.startswith("${HOME}/"):
+            return home + path[len("${HOME}") :]
+        if path.startswith("~/"):
+            return home + path[1:]
+        return path
+
     def exists_nonempty_dir(self, path: str) -> bool:
         raise NotImplementedError
 
@@ -147,9 +185,6 @@ class Remote:
 
     def copy_container_dir_to_local(self, container: str, remote_dir: str, local_dir: Path) -> bool:
         raise NotImplementedError
-
-    def cleanup(self) -> None:
-        pass
 
 
 class AdbRemote(Remote):
@@ -224,6 +259,9 @@ class AdbRemote(Remote):
 class SshRemote(Remote):
     def __init__(self, target: str):
         self.target = target if "@" in target else f"root@{target}"
+
+    def shell(self, command: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+        return self.ssh(command, check=check)
 
     def ssh(self, command: str, check: bool = True) -> subprocess.CompletedProcess[str]:
         return run(["ssh", self.target, command], check=check)
@@ -308,16 +346,20 @@ def select_container(remote: Remote, requested: str | None) -> str | None:
     return None
 
 
-def pull_host_logs(remote: Remote, args: Args, dest: Path) -> bool:
-    for path in args.host_log_dirs:
+def expand_paths(remote: Remote, paths: list[str]) -> list[str]:
+    return list(dict.fromkeys(remote.expand_path(path) for path in paths))
+
+
+def pull_named_dirs(remote: Remote, name: str, dirs: list[str], roots: list[str], discover: bool, dest: Path) -> bool:
+    for path in expand_paths(remote, dirs):
         if remote.exists_nonempty_dir(path):
-            print(f"source=host:{path}", file=sys.stderr)
+            print(f"source={name}:{path}", file=sys.stderr)
             remote.copy_dir_to_local(path, dest)
             return True
-    if not args.no_discover:
-        for path in remote.list_dirs(DISCOVERY_ROOTS, "*/brecourt/log/ros"):
+    if discover:
+        for path in remote.list_dirs(expand_paths(remote, roots), "*/brecourt/log/ros"):
             if remote.exists_nonempty_dir(path):
-                print(f"source=host:{path}", file=sys.stderr)
+                print(f"source={name}:{path}", file=sys.stderr)
                 remote.copy_dir_to_local(path, dest)
                 return True
     return False
@@ -341,14 +383,21 @@ def pull_docker_logs(remote: Remote, args: Args, dest: Path) -> bool:
 
 def pull_logs(remote: Remote, args: Args, dest: Path) -> None:
     dest.mkdir(parents=True, exist_ok=True)
-    if args.source == "host":
-        if not pull_host_logs(remote, args, dest):
-            raise RuntimeError("no non-empty host-mounted ROS log directory found")
+    if args.source == "starling":
+        if not pull_named_dirs(remote, "starling", args.starling_log_dirs, STARLING_DISCOVERY_ROOTS, not args.no_discover, dest):
+            raise RuntimeError("no non-empty Starling ROS log directory found")
+    elif args.source == "host":
+        if not pull_named_dirs(remote, "host", args.host_log_dirs, HOST_DISCOVERY_ROOTS, not args.no_discover, dest):
+            raise RuntimeError("no non-empty host-user ROS log directory found")
     elif args.source == "docker":
         if not pull_docker_logs(remote, args, dest):
             raise RuntimeError("no non-empty ROS log directory found in Docker")
-    elif not pull_host_logs(remote, args, dest) and not pull_docker_logs(remote, args, dest):
-        raise RuntimeError("no ROS logs found in host-mounted paths or Docker")
+    elif (
+        not pull_named_dirs(remote, "starling", args.starling_log_dirs, STARLING_DISCOVERY_ROOTS, not args.no_discover, dest)
+        and not pull_named_dirs(remote, "host", args.host_log_dirs, HOST_DISCOVERY_ROOTS, not args.no_discover, dest)
+        and not pull_docker_logs(remote, args, dest)
+    ):
+        raise RuntimeError("no ROS logs found in Starling, host-user, or Docker paths")
 
 
 def main(argv: list[str] | None = None) -> int:

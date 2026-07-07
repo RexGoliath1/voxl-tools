@@ -157,28 +157,30 @@ systemctl restart voxl-mavlink-server
 
 QGC default listen port is `14550`.
 
-### Pull Brecourt ROS logs from VOXL Docker
+### Pull Brecourt TFLite ROS logs
 
-If the Brecourt ROS Docker run wrote logs to a host-mounted volume, or if the
-Docker container still exists, pull ROS logs over adb or SSH/SCP:
+If the Brecourt TFLite ROS Docker run wrote logs to a Starling path, a
+host-user path, or if the Docker container still exists, pull ROS logs over adb
+or SSH/SCP:
 
 ```bash
-./pull_ros_logs
+./pull_tflite_ros_logs
 ```
 
 Default output:
 
 ```text
-ros_logs/adb_<serial>/<ROS datetime log directories>
+logs/adb_<serial>/<ROS datetime log directories>
 ```
 
-The default `auto` source first looks for saved host logs such as
-`*/brecourt/log/ros`, then falls back to copying from a `brecourt-ros2` Docker
-container. Useful overrides:
+The default `auto` source checks Starling paths such as `/home/root` and
+`/data`, then host-user paths under `$HOME`, then falls back to copying from a
+`brecourt-ros2` Docker container. Useful overrides:
 
 ```bash
-./pull_ros_logs --serial d6da8cd6
-./pull_ros_logs --scp 192.168.1.57
-./pull_ros_logs --source docker
-./pull_ros_logs --source host --remote-repo-dir /data/brecourt_tflite_tracker
+./pull_tflite_ros_logs --serial d6da8cd6
+./pull_tflite_ros_logs --scp 192.168.1.57
+./pull_tflite_ros_logs --source starling
+./pull_tflite_ros_logs --source host --remote-repo-dir '$HOME/git/Brecourt/brecourt_tflite_tracker'
+./pull_tflite_ros_logs --source docker
 ```
