@@ -118,6 +118,29 @@ The field `secondary_static_gcs_ip` sets a static push target (e.g., Mac's IP
 on the LAN). Update it when the Mac's IP changes (DHCP):
 
 ```bash
+# From this repo on macOS or Linux, with the Starling connected over adb:
+./set_mavlink_gcs.py
+
+# If autodetect chooses the wrong interface/IP:
+./set_mavlink_gcs.py --interface en0
+./set_mavlink_gcs.py --ip 192.168.1.104
+
+# Optional SSH mode when you already know the drone IP:
+./set_mavlink_gcs.py --drone-ip 192.168.1.42
+
+# If working with an older setup that uses the primary slot:
+./set_mavlink_gcs.py --primary
+```
+
+The script backs up the remote config, writes the selected field, and runs
+`systemctl restart voxl-mavlink-server`. Default transport is adb. Passing
+`--drone-ip` switches to SSH mode with the default VOXL login
+`root` / `oelinux123`; SSH password mode requires `sshpass`, while SSH keys can
+be used with `--password ''`.
+
+Manual equivalent:
+
+```bash
 # Replace old IP with new IP
 sed -i 's/"secondary_static_gcs_ip":.*"OLD"/"secondary_static_gcs_ip":\t"NEW"/' \
     /etc/modalai/voxl-mavlink-server.conf
