@@ -4,7 +4,7 @@
 # EKF2 setup: VIO (open-vins) as position source, rangefinder (VL53L1X, 3m max) as
 # height reference with baro as fallback, optical flow fused, GPS and mag disabled.
 #
-# Apply on drone: python3 apply_params.py brecourt_vio.params
+# Apply on drone: python3 apply_params brecourt_vio.params
 #
 # Verify after applying:
 #   px4-param show | grep -E 'EKF2_EV_CTRL|EKF2_GPS_CTRL|EKF2_HGT_REF|EKF2_BARO_CTRL|EKF2_OF_CTRL|EKF2_EV_QMIN|EKF2_RNG_CTRL|EKF2_MAG_TYPE|SYS_HAS_GPS|SYS_HAS_MAG'

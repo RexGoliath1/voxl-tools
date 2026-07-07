@@ -4,7 +4,7 @@
 Runs on the VOXL2 drone directly (px4-param is a VOXL binary, not standard PX4).
 
 Usage:
-    python3 apply_params.py <params_file> [--dry-run]
+    python3 apply_params <params_file> [--dry-run]
 """
 
 import subprocess

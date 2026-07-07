@@ -9,14 +9,14 @@ Scripts and param profiles for VOXL2 / ModalAI drone configuration.
 scp params/brecourt_vio.params root@<DRONE_IP>:/tmp/
 
 # 2. Also push the apply script
-scp apply_params.py root@<DRONE_IP>:/tmp/
+scp apply_params root@<DRONE_IP>:/tmp/
 
 # 3. SSH into drone and apply
 ssh root@<DRONE_IP>
-python3 /tmp/apply_params.py /tmp/brecourt_vio.params
+python3 /tmp/apply_params /tmp/brecourt_vio.params
 
 # 4. (Optional) dry-run first to preview what will be set
-python3 /tmp/apply_params.py /tmp/brecourt_vio.params --dry-run
+python3 /tmp/apply_params /tmp/brecourt_vio.params --dry-run
 ```
 
 ## Workflow: capture a full param dump from a reference drone
@@ -36,7 +36,7 @@ x + EKF2_EV_CTRL [294,573] : 15
 
 Use it as a human-readable reference to build or verify a profile file. The
 `.params` profile files in `params/` use the standard QGC tab-separated format
-that `apply_params.py` parses.
+that `apply_params` parses.
 
 ## Param profiles
 
@@ -119,17 +119,17 @@ on the LAN). Update it when the Mac's IP changes (DHCP):
 
 ```bash
 # From this repo on macOS or Linux, with the Starling connected over adb:
-./set_mavlink_gcs.py
+./set_mavlink_gcs
 
 # If autodetect chooses the wrong interface/IP:
-./set_mavlink_gcs.py --interface en0
-./set_mavlink_gcs.py --ip 192.168.1.104
+./set_mavlink_gcs --interface en0
+./set_mavlink_gcs --ip 192.168.1.104
 
 # Optional SSH mode when you already know the drone IP:
-./set_mavlink_gcs.py --drone-ip 192.168.1.42
+./set_mavlink_gcs --drone-ip 192.168.1.42
 
 # If working with an older setup that uses the primary slot:
-./set_mavlink_gcs.py --primary
+./set_mavlink_gcs --primary
 ```
 
 The script backs up the remote config, writes the selected field, and runs
@@ -156,7 +156,7 @@ If the Brecourt ROS Docker run wrote logs to a host-mounted volume, or if the
 Docker container still exists, pull ROS logs over adb or SSH/SCP:
 
 ```bash
-./pull_ros_logs.sh
+./pull_ros_logs
 ```
 
 Default output:
@@ -170,8 +170,8 @@ The default `auto` source first looks for saved host logs such as
 container. Useful overrides:
 
 ```bash
-./pull_ros_logs.sh --serial d6da8cd6
-./pull_ros_logs.sh --scp 192.168.1.57
-./pull_ros_logs.sh --source docker
-./pull_ros_logs.sh --source host --remote-repo-dir /data/brecourt_tflite_tracker
+./pull_ros_logs --serial d6da8cd6
+./pull_ros_logs --scp 192.168.1.57
+./pull_ros_logs --source docker
+./pull_ros_logs --source host --remote-repo-dir /data/brecourt_tflite_tracker
 ```
