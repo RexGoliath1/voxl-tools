@@ -174,3 +174,11 @@ container. Useful overrides:
 ./pull_ros_logs.sh --source host --remote-repo-dir /data/brecourt_tflite_tracker root@192.168.1.57
 ./pull_ros_logs.sh --host-log-dir /root/brecourt/log/ros root@192.168.1.57
 ```
+
+If the drone is connected over USB to the current machine instead of reachable
+over SSH, use adb:
+
+```bash
+./pull_ros_logs_adb.sh
+./pull_ros_logs_adb.sh --serial d6da8cd6
+```
