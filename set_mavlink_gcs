@@ -44,6 +44,9 @@ class Args:
     adb: str
     dry_run: bool
     no_restart: bool
+    check_udp: bool
+    udp_port: int
+    udp_timeout: float
 
 
 def run(
@@ -116,6 +119,19 @@ def edit_config_text(text: str, field: str, ip: str) -> tuple[str, str]:
     old_ip = match.group(2)
     new_text = pattern.sub(r"\g<1>" + ip + r"\3", text, count=1)
     return new_text, old_ip
+
+
+def run_udp_checker(port: int, timeout: float) -> None:
+    checker = Path(__file__).with_name("check_mavlink_udp")
+    if not checker.exists():
+        raise RuntimeError(f"UDP checker not found: {checker}")
+    result = run([sys.executable, str(checker), "--port", str(port), "--timeout", str(timeout)], check=False)
+    if result.stdout:
+        print(result.stdout.rstrip())
+    if result.stderr:
+        print(result.stderr.rstrip(), file=sys.stderr)
+    if result.returncode != 0:
+        raise RuntimeError(f"UDP check failed with exit code {result.returncode}")
 
 
 class Remote:
@@ -233,6 +249,9 @@ def parse_args(argv: list[str]) -> Args:
     parser.add_argument("--adb", default="adb", help="adb executable path; default: adb")
     parser.add_argument("--dry-run", action="store_true", help="show what would change without editing or restarting")
     parser.add_argument("--no-restart", action="store_true", help="update config but do not restart the service")
+    parser.add_argument("--check-udp", action="store_true", help="after update/restart, listen for inbound MAVLink UDP")
+    parser.add_argument("--udp-port", type=int, default=14550, help="UDP port for --check-udp; default: 14550")
+    parser.add_argument("--udp-timeout", type=float, default=8.0, help="seconds to wait for --check-udp; default: 8")
     ns = parser.parse_args(argv)
     return Args(
         transport=ns.transport or ("ssh" if ns.drone_ip else "adb"),
@@ -249,6 +268,9 @@ def parse_args(argv: list[str]) -> Args:
         adb=ns.adb,
         dry_run=ns.dry_run,
         no_restart=ns.no_restart,
+        check_udp=ns.check_udp,
+        udp_port=ns.udp_port,
+        udp_timeout=ns.udp_timeout,
     )
 
 
@@ -288,6 +310,9 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 status = remote.restart_service(args.service)
                 print(f"{args.service}: {status or 'unknown'}")
+
+            if args.check_udp:
+                run_udp_checker(args.udp_port, args.udp_timeout)
     except RuntimeError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
