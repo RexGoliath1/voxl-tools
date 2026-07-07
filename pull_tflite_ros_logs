@@ -349,6 +349,13 @@ def extract_tar_bytes(data: bytes, destination: Path) -> None:
         tmp.flush()
         with tarfile.open(tmp.name, "r:gz") as tar:
             tar.extractall(destination)
+    normalize_permissions(destination)
+
+
+def normalize_permissions(path: Path) -> None:
+    for child in path.rglob("*"):
+        child.chmod(0o755 if child.is_dir() else 0o644)
+    path.chmod(0o755)
 
 
 def select_container(remote: Remote, requested: str | None) -> str | None:
