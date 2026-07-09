@@ -251,6 +251,12 @@ def choose_version(target, requested, platform_sku):
     return versions[-1]
 
 
+def configure_supports_version(target, configure):
+    result = target.shell("{} -h 2>&1".format(shell_quote(configure)), check=False)
+    text = (result.stdout or "") + (result.stderr or "")
+    return "--version" in text or re.search(r"(^|\s)-v[, ]", text) is not None
+
+
 def detect_target_platform(target, args):
     raw_sku = read_remote_file(target, args.sku_file)
     sku = normalize_sku(raw_sku)
@@ -275,7 +281,7 @@ def detect_target_platform(target, args):
     return platform, source, raw_sku, hardware, hardware_raw
 
 
-def confirm_or_exit(args, target, platform, version, raw_sku, hardware, source):
+def confirm_or_exit(args, target, platform, version, raw_sku, hardware, source, supports_version):
     info = KNOWN_SKUS.get(platform, {})
     label = info.get("label", "unknown vehicle")
     print("target: {}".format(target.label))
@@ -285,7 +291,10 @@ def confirm_or_exit(args, target, platform, version, raw_sku, hardware, source):
     else:
         print("detected SKU: <none>")
     print("selected params: {} ({}) from {}".format(platform, label, source))
-    print("params version: {}".format(version))
+    if supports_version:
+        print("params version: {}".format(version))
+    else:
+        print("params version: {} (remote loader default; -v unsupported)".format(version))
     if args.skip_cal:
         print("calibration restore: skipped")
     else:
@@ -298,15 +307,15 @@ def confirm_or_exit(args, target, platform, version, raw_sku, hardware, source):
         raise SystemExit("aborted")
 
 
-def build_remote_command(args, platform, version):
+def build_remote_command(args, platform, version, supports_version):
     parts = [
         args.configure,
         "-n",
         "-p",
         platform,
-        "-v",
-        version,
     ]
+    if supports_version:
+        parts.extend(["-v", version])
     if args.skip_cal:
         parts.append("--skip-cal")
     if args.quiet:
@@ -377,8 +386,15 @@ def main(argv=None):
         target = choose_target(args)
         platform, source, raw_sku, hardware, hardware_raw = detect_target_platform(target, args)
         version = choose_version(target, args.version, platform)
-        confirm_or_exit(args, target, platform, version, raw_sku, hardware, source)
-        command = build_remote_command(args, platform, version)
+        supports_version = configure_supports_version(target, args.configure)
+        if args.version != "auto" and not supports_version:
+            raise RuntimeError(
+                "{} on {} does not support --version/-v; omit --version to use its built-in params bundle".format(
+                    args.configure, target.label
+                )
+            )
+        confirm_or_exit(args, target, platform, version, raw_sku, hardware, source, supports_version)
+        command = build_remote_command(args, platform, version, supports_version)
         print("remote command: {}".format(command))
         if args.dry_run:
             return 0
