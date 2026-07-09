@@ -44,6 +44,59 @@ that `apply_params` parses.
 |------|-------------|
 | `params/brecourt_vio.params` | VIO-primary indoor config (Brecourt production) |
 
+## VOXL utility scripts
+
+Small on-drone helper scripts live in `utilities/`.
+
+### Flash ModalAI PX4 base params for the detected vehicle
+
+Copy `utilities/voxl-flash-px4-params` to the VOXL and run it there. It reads
+`/data/modalai/sku.txt` first, then falls back to `voxl-platform`. For Starling
+2 Max, the PX4 parameter platform is `MRB-D0012`; `M0054` is the VOXL 2 hardware
+platform.
+
+```bash
+# Preview what would be applied
+python3 utilities/voxl-flash-px4-params --dry-run
+
+# Apply detected params, preserving existing PX4 calibration files
+python3 utilities/voxl-flash-px4-params
+
+# Non-interactive detected load
+python3 utilities/voxl-flash-px4-params --yes
+
+# Force a specific platform or params bundle only when needed
+python3 utilities/voxl-flash-px4-params --platform MRB-D0012 --version v1.14 --yes
+```
+
+The script wraps ModalAI's `voxl-configure-px4-params -n -p <platform> -v
+<version>`. The version is the installed ModalAI PX4 parameter bundle directory
+such as `/usr/share/modalai/px4_params/v1.14`, not the VOXL hardware platform.
+By default the script chooses the newest installed params version that contains
+the detected vehicle file; pass `--version` only to override that choice.
+
+### Restart common VOXL services
+
+Copy `utilities/voxl-restart-services` to the VOXL and run it there. With no
+arguments it shows a numbered menu. It also accepts short aliases:
+
+```bash
+# Menu selection
+python3 utilities/voxl-restart-services
+
+# Restart camera server and MAVLink server
+python3 utilities/voxl-restart-services camera mavlink
+
+# Show common/discovered VOXL services and current state
+python3 utilities/voxl-restart-services --list
+
+# Preview restart commands
+python3 utilities/voxl-restart-services camera mavlink --dry-run
+```
+
+Common aliases include `camera`, `mavlink`, `vision`, `openvins`, `qvio`, `imu`,
+`rangefinder`, `tflite`, `portal`, `px4`, `streamer`, and `mavcam`.
+
 ## Lessons learned
 
 ### `px4-param` is a VOXL binary, not a standard PX4 tool

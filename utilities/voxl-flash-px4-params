@@ -1,0 +1,246 @@
+#!/usr/bin/env python3
+"""Apply ModalAI PX4 parameter bundles for the detected VOXL vehicle.
+
+Run this on the VOXL. It wraps voxl-configure-px4-params with a small amount of
+platform/SKU detection and a confirmation prompt.
+"""
+
+import argparse
+import os
+import re
+import subprocess
+import sys
+
+
+SKU_PATH = "/data/modalai/sku.txt"
+PARAM_ROOT = "/usr/share/modalai/px4_params"
+DEFAULT_CONFIGURE = "voxl-configure-px4-params"
+
+KNOWN_SKUS = {
+    "MRB-D0012": {
+        "label": "Starling 2 Max",
+        "hardware": "M0054",
+        "file_hint": "platforms/D0012_Starling_2_Max.params",
+    },
+    "MRB-D0014": {
+        "label": "Starling 2",
+        "hardware": "M0054",
+        "file_hint": "platforms/D0014_Starling_2.params",
+    },
+}
+
+# Hardware-only fallback is intentionally small. Many products can share the
+# same VOXL platform, so prefer SKU detection whenever possible.
+HARDWARE_FALLBACK = {
+    "M0054": "MRB-D0012",
+}
+
+
+def run(cmd, check=True):
+    try:
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError("{} was not found".format(cmd[0])) from exc
+    if check and result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or "exit code {}".format(result.returncode)
+        raise RuntimeError("{} failed: {}".format(" ".join(cmd), detail))
+    return result
+
+
+def read_first_line(path):
+    try:
+        with open(path) as handle:
+            return handle.read().strip()
+    except OSError:
+        return None
+
+
+def detect_hardware_platform():
+    try:
+        result = run(["voxl-platform"], check=False)
+    except RuntimeError:
+        return None, None
+    text = (result.stdout or result.stderr).strip()
+    if result.returncode != 0 or not text:
+        return None, text
+    match = re.search(r"\bM\d{4}\b", text)
+    return (match.group(0) if match else text.splitlines()[-1].strip()), text
+
+
+def normalize_sku(raw_sku):
+    if not raw_sku:
+        return None
+    token = raw_sku.strip().split()[0]
+    if token in KNOWN_SKUS:
+        return token
+    for sku in sorted(KNOWN_SKUS, key=len, reverse=True):
+        if token.startswith(sku):
+            return sku
+    match = re.match(r"((?:M|P|T)RB-D\d{4}(?:-[A-Z0-9]+)?)", token)
+    return match.group(1) if match else token
+
+
+def version_key(name):
+    nums = re.findall(r"\d+", name)
+    return tuple(int(part) for part in nums) if nums else (0,)
+
+
+def installed_versions(platform_sku):
+    if not os.path.isdir(PARAM_ROOT):
+        return []
+    hint = KNOWN_SKUS.get(platform_sku, {}).get("file_hint")
+    versions = []
+    for name in os.listdir(PARAM_ROOT):
+        path = os.path.join(PARAM_ROOT, name)
+        if not name.startswith("v") or not os.path.isdir(path):
+            continue
+        if hint and not os.path.exists(os.path.join(path, hint)):
+            continue
+        versions.append(name)
+    return sorted(versions, key=version_key)
+
+
+def choose_version(requested, platform_sku):
+    if requested != "auto":
+        return requested
+    versions = installed_versions(platform_sku)
+    if not versions:
+        raise RuntimeError(
+            "could not find installed PX4 params for {} under {}".format(platform_sku, PARAM_ROOT)
+        )
+    return versions[-1]
+
+
+def detect_target(args):
+    raw_sku = read_first_line(args.sku_file)
+    sku = normalize_sku(raw_sku)
+    hardware, hardware_raw = detect_hardware_platform()
+
+    if args.platform:
+        target = args.platform
+        source = "command line"
+    elif sku:
+        target = sku
+        source = args.sku_file
+    elif hardware in HARDWARE_FALLBACK and not args.no_hardware_fallback:
+        target = HARDWARE_FALLBACK[hardware]
+        source = "voxl-platform fallback for {}".format(hardware)
+    else:
+        raise RuntimeError(
+            "could not choose a PX4 param platform. Pass --platform MRB-D0012 or ensure {} exists.".format(
+                args.sku_file
+            )
+        )
+
+    return target, source, raw_sku, hardware, hardware_raw
+
+
+def confirm_or_exit(args, target, version, raw_sku, hardware, source):
+    info = KNOWN_SKUS.get(target, {})
+    label = info.get("label", "unknown vehicle")
+    print("detected hardware: {}".format(hardware or "unknown"))
+    if raw_sku:
+        print("detected SKU: {}".format(raw_sku))
+    else:
+        print("detected SKU: <none>")
+    print("selected params: {} ({}) from {}".format(target, label, source))
+    print("params version: {}".format(version))
+    if args.skip_cal:
+        print("calibration restore: skipped")
+    else:
+        print("calibration restore: enabled")
+
+    if args.dry_run:
+        return
+    if args.yes:
+        return
+    answer = input("Apply these PX4 params now? [y/N] ").strip().lower()
+    if answer not in ("y", "yes"):
+        raise SystemExit("aborted")
+
+
+def build_command(args, target, version):
+    cmd = [
+        args.configure,
+        "-n",
+        "-p",
+        target,
+        "-v",
+        version,
+    ]
+    if args.skip_cal:
+        cmd.append("--skip-cal")
+    if args.quiet:
+        cmd.append("--quiet")
+    return cmd
+
+
+def parse_args(argv):
+    parser = argparse.ArgumentParser(
+        description="Apply ModalAI PX4 parameter defaults for the detected VOXL vehicle."
+    )
+    parser.add_argument(
+        "-p",
+        "--platform",
+        help="ModalAI PX4 param platform/SKU to apply, e.g. MRB-D0012 for Starling 2 Max",
+    )
+    parser.add_argument(
+        "-v",
+        "--version",
+        default="auto",
+        help="PX4 params version to pass to voxl-configure-px4-params; default: auto",
+    )
+    parser.add_argument(
+        "--sku-file",
+        default=SKU_PATH,
+        help="SKU file to read before falling back to voxl-platform; default: {}".format(SKU_PATH),
+    )
+    parser.add_argument(
+        "--configure",
+        default=DEFAULT_CONFIGURE,
+        help="voxl-configure-px4-params executable path; default: {}".format(DEFAULT_CONFIGURE),
+    )
+    parser.add_argument(
+        "--skip-cal",
+        action="store_true",
+        help="do not restore existing PX4 calibration files after loading platform params",
+    )
+    parser.add_argument(
+        "--no-hardware-fallback",
+        action="store_true",
+        help="fail if SKU is unavailable instead of mapping hardware platform to a default vehicle",
+    )
+    parser.add_argument("--quiet", action="store_true", help="pass --quiet to voxl-configure-px4-params")
+    parser.add_argument("-y", "--yes", action="store_true", help="do not prompt before applying params")
+    parser.add_argument("--dry-run", action="store_true", help="print the detected target and command only")
+    return parser.parse_args(argv)
+
+
+def main(argv=None):
+    args = parse_args(sys.argv[1:] if argv is None else argv)
+    try:
+        target, source, raw_sku, hardware, hardware_raw = detect_target(args)
+        version = choose_version(args.version, target)
+        confirm_or_exit(args, target, version, raw_sku, hardware, source)
+        cmd = build_command(args, target, version)
+        print("command: {}".format(" ".join(cmd)))
+        if args.dry_run:
+            return 0
+        result = run(cmd, check=False)
+        if result.stdout:
+            print(result.stdout, end="")
+        if result.stderr:
+            print(result.stderr, end="", file=sys.stderr)
+        return result.returncode
+    except RuntimeError as exc:
+        print("ERROR: {}".format(exc), file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,209 @@
+#!/usr/bin/env python3
+"""Restart commonly used ModalAI VOXL systemd services.
+
+Run this on the VOXL. With no service names, it opens a small numbered menu.
+"""
+
+import argparse
+import os
+import subprocess
+import sys
+
+
+COMMON_SERVICES = [
+    ("camera", "voxl-camera-server"),
+    ("mavlink", "voxl-mavlink-server"),
+    ("vision", "voxl-vision-hub"),
+    ("openvins", "voxl-open-vins-server"),
+    ("qvio", "voxl-qvio-server"),
+    ("imu", "voxl-imu-server"),
+    ("rangefinder", "qrb5165-rangefinder-server"),
+    ("tflite", "voxl-tflite-server"),
+    ("portal", "voxl-portal"),
+    ("px4", "voxl-px4"),
+    ("streamer", "voxl-streamer"),
+    ("mavcam", "voxl-mavcam-manager"),
+]
+
+ALIASES = {
+    "cam": "voxl-camera-server",
+    "camera": "voxl-camera-server",
+    "camera-server": "voxl-camera-server",
+    "mav": "voxl-mavlink-server",
+    "mavlink": "voxl-mavlink-server",
+    "mavlink-server": "voxl-mavlink-server",
+    "vision": "voxl-vision-hub",
+    "vision-hub": "voxl-vision-hub",
+    "vvh": "voxl-vision-hub",
+    "openvins": "voxl-open-vins-server",
+    "open-vins": "voxl-open-vins-server",
+    "vins": "voxl-open-vins-server",
+    "qvio": "voxl-qvio-server",
+    "imu": "voxl-imu-server",
+    "range": "qrb5165-rangefinder-server",
+    "rangefinder": "qrb5165-rangefinder-server",
+    "tof": "qrb5165-rangefinder-server",
+    "tflite": "voxl-tflite-server",
+    "portal": "voxl-portal",
+    "px4": "voxl-px4",
+    "streamer": "voxl-streamer",
+    "mavcam": "voxl-mavcam-manager",
+}
+
+
+def run(cmd, check=False):
+    try:
+        return subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
+            check=check,
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError("{} was not found".format(cmd[0])) from exc
+
+
+def unit_name(name):
+    if name.endswith(".service"):
+        name = name[:-8]
+    return ALIASES.get(name, name)
+
+
+def service_exists(service):
+    result = run(["systemctl", "status", service], check=False)
+    text = (result.stdout or "") + (result.stderr or "")
+    return "Loaded: not-found" not in text and "could not be found" not in text
+
+
+def is_enabled(service):
+    result = run(["systemctl", "is-enabled", service], check=False)
+    return result.stdout.strip() or "unknown"
+
+
+def is_active(service):
+    result = run(["systemctl", "is-active", service], check=False)
+    return result.stdout.strip() or "unknown"
+
+
+def discovered_services():
+    result = run(["systemctl", "list-unit-files", "--type=service", "--no-legend"], check=False)
+    services = []
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if not parts:
+            continue
+        unit = parts[0]
+        if not unit.endswith(".service"):
+            continue
+        service = unit[:-8]
+        if service.startswith("voxl-") or service.startswith("qrb5165-"):
+            services.append(service)
+    return sorted(set(services))
+
+
+def ordered_menu_services():
+    common = [service for _, service in COMMON_SERVICES]
+    discovered = [service for service in discovered_services() if service not in common]
+    return common + discovered
+
+
+def print_services(services):
+    for index, service in enumerate(services, start=1):
+        print(
+            "{:2d}. {:32s} enabled={:10s} active={}".format(
+                index,
+                service,
+                is_enabled(service),
+                is_active(service),
+            )
+        )
+
+
+def parse_selection(text, services):
+    selected = []
+    by_index = {str(index): service for index, service in enumerate(services, start=1)}
+    for raw in text.replace(",", " ").split():
+        service = by_index.get(raw) or unit_name(raw)
+        if service not in selected:
+            selected.append(service)
+    return selected
+
+
+def interactive_select():
+    services = ordered_menu_services()
+    print_services(services)
+    print("")
+    print("Select services by number or name, separated by spaces or commas.")
+    answer = input("restart> ").strip()
+    if not answer:
+        return []
+    return parse_selection(answer, services)
+
+
+def restart_service(service, dry_run=False):
+    if dry_run:
+        print("[dry] systemctl restart {}".format(service))
+        return 0
+    result = run(["systemctl", "restart", service], check=False)
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or "exit code {}".format(result.returncode)
+        print("ERR  {}: {}".format(service, detail), file=sys.stderr)
+        return result.returncode
+    print("ok   {}: active={}".format(service, is_active(service)))
+    return 0
+
+
+def parse_args(argv):
+    parser = argparse.ArgumentParser(description="Restart VOXL systemd services by alias or menu selection.")
+    parser.add_argument(
+        "services",
+        nargs="*",
+        help="services or aliases to restart, e.g. camera mavlink vision",
+    )
+    parser.add_argument("--list", action="store_true", help="show common and discovered VOXL services")
+    parser.add_argument("--status", action="store_true", help="show status for selected services without restarting")
+    parser.add_argument("--dry-run", action="store_true", help="print restart commands without running them")
+    parser.add_argument("--yes", action="store_true", help="do not prompt before restarting selected services")
+    return parser.parse_args(argv)
+
+
+def main(argv=None):
+    args = parse_args(sys.argv[1:] if argv is None else argv)
+    try:
+        if args.list:
+            print_services(ordered_menu_services())
+            return 0
+
+        selected = [unit_name(name) for name in args.services] if args.services else interactive_select()
+        if not selected:
+            print("no services selected")
+            return 0
+
+        if not args.dry_run:
+            missing = [service for service in selected if not service_exists(service)]
+            if missing:
+                print("WARNING: not found by systemctl: {}".format(", ".join(missing)), file=sys.stderr)
+
+        if args.status:
+            print_services(selected)
+            return 0
+
+        print("selected: {}".format(", ".join(selected)))
+        if not args.yes and not args.dry_run:
+            answer = input("Restart selected services now? [y/N] ").strip().lower()
+            if answer not in ("y", "yes"):
+                print("aborted")
+                return 0
+
+        failed = 0
+        for service in selected:
+            failed += 1 if restart_service(service, args.dry_run) else 0
+        return 1 if failed else 0
+    except RuntimeError as exc:
+        print("ERROR: {}".format(exc), file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
