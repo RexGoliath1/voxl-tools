@@ -211,9 +211,10 @@ def unit_name(name):
 
 
 def service_exists(target, service):
-    result = target.shell("systemctl status {} 2>&1".format(shell_quote(service)), check=False)
-    text = (result.stdout or "") + (result.stderr or "")
-    return "Loaded: not-found" not in text and "could not be found" not in text
+    unit = service if service.endswith(".service") else service + ".service"
+    command = "systemctl list-unit-files --type=service {} --no-legend 2>/dev/null".format(shell_quote(unit))
+    result = target.shell(command, check=False)
+    return result.returncode == 0 and bool(result.stdout.strip())
 
 
 def is_enabled(target, service):
