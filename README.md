@@ -193,10 +193,10 @@ on the LAN). Update it when the Mac's IP changes (DHCP):
 ./set_mavlink_gcs --ip 192.168.1.104
 
 # Optional SSH mode when you already know the drone IP:
-./set_mavlink_gcs --drone-ip 192.168.1.42
+./set_mavlink_gcs --ssh 192.168.1.42
 
 # Also verify inbound MAVLink UDP before opening QGC:
-./set_mavlink_gcs --drone-ip 192.168.1.42 --check-udp
+./set_mavlink_gcs --ssh 192.168.1.42 --check-udp
 
 # If working with an older setup that uses the primary slot:
 ./set_mavlink_gcs --primary
@@ -207,7 +207,7 @@ on the LAN). Update it when the Mac's IP changes (DHCP):
 
 The script backs up the remote config, writes the selected field, and runs
 `systemctl restart voxl-mavlink-server`. Default transport is adb. Passing
-`--drone-ip` switches to SSH mode with the default VOXL login
+`--ssh`, `--host`, or `--drone-ip` switches to SSH mode with the default VOXL login
 `root` / `oelinux123`; SSH password mode requires `sshpass`, while SSH keys can
 be used with `--password ''`. Passing `--check-udp` listens briefly on UDP
 `14550` after the restart, so run it before opening QGC.
