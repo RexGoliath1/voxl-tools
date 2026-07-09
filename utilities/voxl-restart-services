@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
-"""Restart commonly used ModalAI VOXL systemd services.
-
-Run this on the VOXL. With no service names, it opens a small numbered menu.
-"""
+"""Restart commonly used ModalAI VOXL systemd services over adb, SSH, or locally."""
 
 import argparse
 import os
+import shutil
 import subprocess
 import sys
 
+
+DEFAULT_REMOTE_USER = "root"
+DEFAULT_REMOTE_PASSWORD = "oelinux123"
+EXIT_MARKER = "__VOXL_RESTART_EXIT__:"
 
 COMMON_SERVICES = [
     ("camera", "voxl-camera-server"),
@@ -51,17 +53,155 @@ ALIASES = {
 }
 
 
-def run(cmd, check=False):
+def run(cmd, check=True, env=None):
     try:
-        return subprocess.run(
+        result = subprocess.run(
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             universal_newlines=True,
-            check=check,
+            env=env,
         )
     except FileNotFoundError as exc:
         raise RuntimeError("{} was not found".format(cmd[0])) from exc
+    if check and result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or "exit code {}".format(result.returncode)
+        raise RuntimeError("{} failed: {}".format(" ".join(cmd), detail))
+    return result
+
+
+def shell_quote(value):
+    return "'" + value.replace("'", "'\"'\"'") + "'"
+
+
+def parse_marked_result(result):
+    text = result.stdout or ""
+    marker_index = text.rfind(EXIT_MARKER)
+    if marker_index < 0:
+        return result.returncode, result.stdout, result.stderr
+    rc_text = text[marker_index + len(EXIT_MARKER) :].strip().splitlines()[0]
+    stdout = text[:marker_index].rstrip("\n")
+    try:
+        rc = int(rc_text)
+    except ValueError:
+        rc = result.returncode
+    return rc, stdout, result.stderr
+
+
+def marked_shell(command):
+    script = command + "\nrc=$?\nprintf '\\n{}%s\\n' \"$rc\"\nexit \"$rc\"".format(EXIT_MARKER)
+    return "sh -lc {}".format(shell_quote(script))
+
+
+class Target:
+    label = "unknown"
+
+    def shell(self, command, check=True):
+        raise NotImplementedError
+
+
+class LocalTarget(Target):
+    label = "local"
+
+    def shell(self, command, check=True):
+        return run(["sh", "-lc", command], check=check)
+
+
+class AdbTarget(Target):
+    def __init__(self, adb, serial):
+        self.adb = adb
+        self.serial = serial or self._select_single_device()
+        self.label = "adb:{}".format(self.serial)
+
+    def _select_single_device(self):
+        if shutil.which(self.adb) is None:
+            raise RuntimeError("adb executable not found: {}".format(self.adb))
+        run([self.adb, "start-server"])
+        devices_output = run([self.adb, "devices"]).stdout
+        devices = []
+        for line in devices_output.splitlines()[1:]:
+            parts = line.split()
+            if len(parts) >= 2 and parts[1] == "device":
+                devices.append(parts[0])
+        if not devices:
+            raise RuntimeError("no adb device found. Connected devices:\n{}".format(devices_output))
+        if len(devices) > 1:
+            raise RuntimeError("multiple adb devices found; rerun with --serial.\n{}".format(devices_output))
+        return devices[0]
+
+    def shell(self, command, check=True):
+        result = run([self.adb, "-s", self.serial, "shell", marked_shell(command)], check=False)
+        rc, stdout, stderr = parse_marked_result(result)
+        completed = subprocess.CompletedProcess(result.args, rc, stdout, stderr)
+        if check and rc != 0:
+            detail = stderr.strip() or stdout.strip() or "exit code {}".format(rc)
+            raise RuntimeError("adb shell failed: {}".format(detail))
+        return completed
+
+
+class SshTarget(Target):
+    def __init__(self, args):
+        self.target = "{}@{}".format(args.user, args.host)
+        self.port = str(args.ssh_port)
+        self.env = None
+        self.prefix = []
+        if args.password:
+            sshpass = shutil.which("sshpass")
+            if not sshpass:
+                raise RuntimeError("SSH password mode requires sshpass; install it or use SSH keys with --password ''")
+            self.env = os.environ.copy()
+            self.env["SSHPASS"] = args.password
+            self.prefix = [sshpass, "-e"]
+        self.label = "ssh:{}".format(self.target)
+
+    def shell(self, command, check=True):
+        ssh_cmd = self.prefix + [
+            "ssh",
+            "-p",
+            self.port,
+            "-o",
+            "StrictHostKeyChecking=accept-new",
+            self.target,
+            marked_shell(command),
+        ]
+        result = run(ssh_cmd, check=False, env=self.env)
+        rc, stdout, stderr = parse_marked_result(result)
+        completed = subprocess.CompletedProcess(result.args, rc, stdout, stderr)
+        if check and rc != 0:
+            detail = stderr.strip() or stdout.strip() or "exit code {}".format(rc)
+            raise RuntimeError("ssh command failed: {}".format(detail))
+        return completed
+
+
+def local_voxl_available():
+    return os.path.exists("/data/modalai/sku.txt") or os.path.exists("/etc/modalai")
+
+
+def adb_device_available(adb):
+    if shutil.which(adb) is None:
+        return False
+    result = run([adb, "devices"], check=False)
+    return any(line.split()[1:2] == ["device"] for line in result.stdout.splitlines()[1:])
+
+
+def choose_target(args):
+    if args.transport == "local":
+        return LocalTarget()
+    if args.transport == "adb":
+        return AdbTarget(args.adb, args.serial)
+    if args.transport == "ssh":
+        if not args.host:
+            raise RuntimeError("SSH transport requires --host")
+        return SshTarget(args)
+    if args.host:
+        return SshTarget(args)
+    if local_voxl_available():
+        return LocalTarget()
+    if adb_device_available(args.adb):
+        return AdbTarget(args.adb, args.serial)
+    raise RuntimeError(
+        "could not find a VOXL target. Connect adb, pass --host for SSH, or run on the VOXL with --transport local."
+    )
 
 
 def unit_name(name):
@@ -70,24 +210,24 @@ def unit_name(name):
     return ALIASES.get(name, name)
 
 
-def service_exists(service):
-    result = run(["systemctl", "status", service], check=False)
+def service_exists(target, service):
+    result = target.shell("systemctl status {} 2>&1".format(shell_quote(service)), check=False)
     text = (result.stdout or "") + (result.stderr or "")
     return "Loaded: not-found" not in text and "could not be found" not in text
 
 
-def is_enabled(service):
-    result = run(["systemctl", "is-enabled", service], check=False)
+def is_enabled(target, service):
+    result = target.shell("systemctl is-enabled {} 2>/dev/null".format(shell_quote(service)), check=False)
     return result.stdout.strip() or "unknown"
 
 
-def is_active(service):
-    result = run(["systemctl", "is-active", service], check=False)
+def is_active(target, service):
+    result = target.shell("systemctl is-active {} 2>/dev/null".format(shell_quote(service)), check=False)
     return result.stdout.strip() or "unknown"
 
 
-def discovered_services():
-    result = run(["systemctl", "list-unit-files", "--type=service", "--no-legend"], check=False)
+def discovered_services(target):
+    result = target.shell("systemctl list-unit-files --type=service --no-legend", check=False)
     services = []
     for line in result.stdout.splitlines():
         parts = line.split()
@@ -102,20 +242,21 @@ def discovered_services():
     return sorted(set(services))
 
 
-def ordered_menu_services():
+def ordered_menu_services(target):
     common = [service for _, service in COMMON_SERVICES]
-    discovered = [service for service in discovered_services() if service not in common]
+    discovered = [service for service in discovered_services(target) if service not in common]
     return common + discovered
 
 
-def print_services(services):
+def print_services(target, services):
+    print("target: {}".format(target.label))
     for index, service in enumerate(services, start=1):
         print(
             "{:2d}. {:32s} enabled={:10s} active={}".format(
                 index,
                 service,
-                is_enabled(service),
-                is_active(service),
+                is_enabled(target, service),
+                is_active(target, service),
             )
         )
 
@@ -130,9 +271,9 @@ def parse_selection(text, services):
     return selected
 
 
-def interactive_select():
-    services = ordered_menu_services()
-    print_services(services)
+def interactive_select(target):
+    services = ordered_menu_services(target)
+    print_services(target, services)
     print("")
     print("Select services by number or name, separated by spaces or commas.")
     answer = input("restart> ").strip()
@@ -141,21 +282,38 @@ def interactive_select():
     return parse_selection(answer, services)
 
 
-def restart_service(service, dry_run=False):
+def restart_service(target, service, dry_run=False):
+    command = "systemctl restart {}".format(shell_quote(service))
     if dry_run:
-        print("[dry] systemctl restart {}".format(service))
+        print("[dry] {}: {}".format(target.label, command))
         return 0
-    result = run(["systemctl", "restart", service], check=False)
+    result = target.shell(command, check=False)
     if result.returncode != 0:
         detail = result.stderr.strip() or result.stdout.strip() or "exit code {}".format(result.returncode)
         print("ERR  {}: {}".format(service, detail), file=sys.stderr)
         return result.returncode
-    print("ok   {}: active={}".format(service, is_active(service)))
+    print("ok   {}: active={}".format(service, is_active(target, service)))
     return 0
 
 
 def parse_args(argv):
-    parser = argparse.ArgumentParser(description="Restart VOXL systemd services by alias or menu selection.")
+    parser = argparse.ArgumentParser(description="Restart VOXL systemd services over adb, SSH, or locally.")
+    parser.add_argument(
+        "--transport",
+        choices=("auto", "adb", "ssh", "local"),
+        default="auto",
+        help="target transport; default: auto",
+    )
+    parser.add_argument("--adb", default="adb", help="adb executable path; default: adb")
+    parser.add_argument("-s", "--serial", help="adb serial when more than one device is connected")
+    parser.add_argument("--host", "--drone-ip", dest="host", help="VOXL IP/hostname for SSH mode")
+    parser.add_argument("--user", default=DEFAULT_REMOTE_USER, help="SSH username; default: root")
+    parser.add_argument(
+        "--password",
+        default=DEFAULT_REMOTE_PASSWORD,
+        help="SSH password for sshpass; use --password '' for SSH keys",
+    )
+    parser.add_argument("--ssh-port", type=int, default=22, help="SSH port; default: 22")
     parser.add_argument(
         "services",
         nargs="*",
@@ -171,24 +329,31 @@ def parse_args(argv):
 def main(argv=None):
     args = parse_args(sys.argv[1:] if argv is None else argv)
     try:
+        if args.dry_run and args.services and args.transport == "auto" and not args.host:
+            target = Target()
+            target.label = "auto"
+        else:
+            target = choose_target(args)
+
         if args.list:
-            print_services(ordered_menu_services())
+            print_services(target, ordered_menu_services(target))
             return 0
 
-        selected = [unit_name(name) for name in args.services] if args.services else interactive_select()
+        selected = [unit_name(name) for name in args.services] if args.services else interactive_select(target)
         if not selected:
             print("no services selected")
             return 0
 
         if not args.dry_run:
-            missing = [service for service in selected if not service_exists(service)]
+            missing = [service for service in selected if not service_exists(target, service)]
             if missing:
                 print("WARNING: not found by systemctl: {}".format(", ".join(missing)), file=sys.stderr)
 
         if args.status:
-            print_services(selected)
+            print_services(target, selected)
             return 0
 
+        print("target: {}".format(target.label))
         print("selected: {}".format(", ".join(selected)))
         if not args.yes and not args.dry_run:
             answer = input("Restart selected services now? [y/N] ").strip().lower()
@@ -198,7 +363,7 @@ def main(argv=None):
 
         failed = 0
         for service in selected:
-            failed += 1 if restart_service(service, args.dry_run) else 0
+            failed += 1 if restart_service(target, service, args.dry_run) else 0
         return 1 if failed else 0
     except RuntimeError as exc:
         print("ERROR: {}".format(exc), file=sys.stderr)

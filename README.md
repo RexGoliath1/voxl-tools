@@ -46,24 +46,32 @@ that `apply_params` parses.
 
 ## VOXL utility scripts
 
-Small on-drone helper scripts live in `utilities/`.
+Small helper scripts live in `utilities/`.
 
 ### Flash ModalAI PX4 base params for the detected vehicle
 
-Copy `utilities/voxl-flash-px4-params` to the VOXL and run it there. It reads
-`/data/modalai/sku.txt` first, then falls back to `voxl-platform`. For Starling
-2 Max, the PX4 parameter platform is `MRB-D0012`; `M0054` is the VOXL 2 hardware
-platform.
+Run `utilities/voxl-flash-px4-params` from this checkout on your Mac/Linux host
+or directly on the VOXL. By default it auto-selects a transport: `--host` uses
+SSH, running on a VOXL uses local execution, otherwise it uses an attached adb
+device. It reads `/data/modalai/sku.txt` first, then falls back to
+`voxl-platform`. For Starling 2 Max, the PX4 parameter platform is `MRB-D0012`;
+`M0054` is the VOXL 2 hardware platform.
 
 ```bash
-# Preview what would be applied
+# Preview what would be applied over adb
 python3 utilities/voxl-flash-px4-params --dry-run
 
-# Apply detected params, preserving existing PX4 calibration files
+# Apply detected params over adb, preserving existing PX4 calibration files
 python3 utilities/voxl-flash-px4-params
 
-# Non-interactive detected load
+# Non-interactive detected load over adb
 python3 utilities/voxl-flash-px4-params --yes
+
+# Use SSH/IP instead of adb
+python3 utilities/voxl-flash-px4-params --host 192.168.1.57
+
+# Run directly on a VOXL
+python3 utilities/voxl-flash-px4-params --transport local
 
 # Force a specific platform or params bundle only when needed
 python3 utilities/voxl-flash-px4-params --platform MRB-D0012 --version v1.14 --yes
@@ -77,15 +85,21 @@ the detected vehicle file; pass `--version` only to override that choice.
 
 ### Restart common VOXL services
 
-Copy `utilities/voxl-restart-services` to the VOXL and run it there. With no
-arguments it shows a numbered menu. It also accepts short aliases:
+Run `utilities/voxl-restart-services` from this checkout or directly on the
+VOXL. It uses the same transport behavior as the PX4 param helper: adb by
+default when a device is attached, `--host` for SSH, or `--transport local` on
+the VOXL. With no service names it shows a numbered menu. It also accepts short
+aliases:
 
 ```bash
-# Menu selection
+# Menu selection over adb
 python3 utilities/voxl-restart-services
 
-# Restart camera server and MAVLink server
+# Restart camera server and MAVLink server over adb
 python3 utilities/voxl-restart-services camera mavlink
+
+# Use SSH/IP instead of adb
+python3 utilities/voxl-restart-services --host 192.168.1.57 camera mavlink
 
 # Show common/discovered VOXL services and current state
 python3 utilities/voxl-restart-services --list

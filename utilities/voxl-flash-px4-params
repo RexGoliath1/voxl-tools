@@ -1,13 +1,10 @@
 #!/usr/bin/env python3
-"""Apply ModalAI PX4 parameter bundles for the detected VOXL vehicle.
-
-Run this on the VOXL. It wraps voxl-configure-px4-params with a small amount of
-platform/SKU detection and a confirmation prompt.
-"""
+"""Apply ModalAI PX4 parameter bundles to a VOXL over adb, SSH, or locally."""
 
 import argparse
 import os
 import re
+import shutil
 import subprocess
 import sys
 
@@ -15,6 +12,9 @@ import sys
 SKU_PATH = "/data/modalai/sku.txt"
 PARAM_ROOT = "/usr/share/modalai/px4_params"
 DEFAULT_CONFIGURE = "voxl-configure-px4-params"
+DEFAULT_REMOTE_USER = "root"
+DEFAULT_REMOTE_PASSWORD = "oelinux123"
+EXIT_MARKER = "__VOXL_FLASH_EXIT__:"
 
 KNOWN_SKUS = {
     "MRB-D0012": {
@@ -36,13 +36,14 @@ HARDWARE_FALLBACK = {
 }
 
 
-def run(cmd, check=True):
+def run(cmd, check=True, env=None):
     try:
         result = subprocess.run(
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             universal_newlines=True,
+            env=env,
         )
     except FileNotFoundError as exc:
         raise RuntimeError("{} was not found".format(cmd[0])) from exc
@@ -52,24 +53,140 @@ def run(cmd, check=True):
     return result
 
 
-def read_first_line(path):
-    try:
-        with open(path) as handle:
-            return handle.read().strip()
-    except OSError:
-        return None
+def shell_quote(value):
+    return "'" + value.replace("'", "'\"'\"'") + "'"
 
 
-def detect_hardware_platform():
-    try:
-        result = run(["voxl-platform"], check=False)
-    except RuntimeError:
-        return None, None
-    text = (result.stdout or result.stderr).strip()
-    if result.returncode != 0 or not text:
-        return None, text
-    match = re.search(r"\bM\d{4}\b", text)
-    return (match.group(0) if match else text.splitlines()[-1].strip()), text
+def parse_marked_result(result):
+    text = result.stdout or ""
+    match = re.search(r"\n?{}(\d+)\s*$".format(re.escape(EXIT_MARKER)), text)
+    if not match:
+        return result.returncode, result.stdout, result.stderr
+    rc = int(match.group(1))
+    stdout = text[: match.start()].rstrip("\n")
+    return rc, stdout, result.stderr
+
+
+def marked_shell(command):
+    script = command + "\nrc=$?\nprintf '\\n{}%s\\n' \"$rc\"\nexit \"$rc\"".format(EXIT_MARKER)
+    return "sh -lc {}".format(shell_quote(script))
+
+
+class Target:
+    label = "unknown"
+
+    def shell(self, command, check=True):
+        raise NotImplementedError
+
+
+class LocalTarget(Target):
+    label = "local"
+
+    def shell(self, command, check=True):
+        return run(["sh", "-lc", command], check=check)
+
+
+class AdbTarget(Target):
+    def __init__(self, adb, serial):
+        self.adb = adb
+        self.serial = serial or self._select_single_device()
+        self.label = "adb:{}".format(self.serial)
+
+    def _select_single_device(self):
+        if shutil.which(self.adb) is None:
+            raise RuntimeError("adb executable not found: {}".format(self.adb))
+        run([self.adb, "start-server"])
+        devices_output = run([self.adb, "devices"]).stdout
+        devices = []
+        for line in devices_output.splitlines()[1:]:
+            parts = line.split()
+            if len(parts) >= 2 and parts[1] == "device":
+                devices.append(parts[0])
+        if not devices:
+            raise RuntimeError("no adb device found. Connected devices:\n{}".format(devices_output))
+        if len(devices) > 1:
+            raise RuntimeError("multiple adb devices found; rerun with --serial.\n{}".format(devices_output))
+        return devices[0]
+
+    def shell(self, command, check=True):
+        result = run([self.adb, "-s", self.serial, "shell", marked_shell(command)], check=False)
+        rc, stdout, stderr = parse_marked_result(result)
+        completed = subprocess.CompletedProcess(result.args, rc, stdout, stderr)
+        if check and rc != 0:
+            detail = stderr.strip() or stdout.strip() or "exit code {}".format(rc)
+            raise RuntimeError("adb shell failed: {}".format(detail))
+        return completed
+
+
+class SshTarget(Target):
+    def __init__(self, args):
+        self.target = "{}@{}".format(args.user, args.host)
+        self.port = str(args.ssh_port)
+        self.env = None
+        self.prefix = []
+        if args.password:
+            sshpass = shutil.which("sshpass")
+            if not sshpass:
+                raise RuntimeError("SSH password mode requires sshpass; install it or use SSH keys with --password ''")
+            self.env = os.environ.copy()
+            self.env["SSHPASS"] = args.password
+            self.prefix = [sshpass, "-e"]
+        self.label = "ssh:{}".format(self.target)
+
+    def shell(self, command, check=True):
+        ssh_cmd = self.prefix + [
+            "ssh",
+            "-p",
+            self.port,
+            "-o",
+            "StrictHostKeyChecking=accept-new",
+            self.target,
+            marked_shell(command),
+        ]
+        result = run(ssh_cmd, check=False, env=self.env)
+        rc, stdout, stderr = parse_marked_result(result)
+        completed = subprocess.CompletedProcess(result.args, rc, stdout, stderr)
+        if check and rc != 0:
+            detail = stderr.strip() or stdout.strip() or "exit code {}".format(rc)
+            raise RuntimeError("ssh command failed: {}".format(detail))
+        return completed
+
+
+def local_voxl_available():
+    if os.path.exists(SKU_PATH):
+        return True
+    if shutil.which("voxl-platform") is None:
+        return False
+    result = run(["voxl-platform"], check=False)
+    return bool((result.stdout or result.stderr).strip())
+
+
+def adb_device_available(adb):
+    if shutil.which(adb) is None:
+        return False
+    result = run([adb, "devices"], check=False)
+    return any(line.split()[1:2] == ["device"] for line in result.stdout.splitlines()[1:])
+
+
+def choose_target(args):
+    if args.transport == "local":
+        return LocalTarget()
+    if args.transport == "adb":
+        return AdbTarget(args.adb, args.serial)
+    if args.transport == "ssh":
+        if not args.host:
+            raise RuntimeError("SSH transport requires --host")
+        return SshTarget(args)
+
+    if args.host:
+        return SshTarget(args)
+    if local_voxl_available():
+        return LocalTarget()
+    if adb_device_available(args.adb):
+        return AdbTarget(args.adb, args.serial)
+    raise RuntimeError(
+        "could not find a VOXL target. Connect adb, pass --host for SSH, or run on the VOXL with --transport local."
+    )
 
 
 def normalize_sku(raw_sku):
@@ -90,100 +207,133 @@ def version_key(name):
     return tuple(int(part) for part in nums) if nums else (0,)
 
 
-def installed_versions(platform_sku):
-    if not os.path.isdir(PARAM_ROOT):
-        return []
+def read_remote_file(target, path):
+    result = target.shell("cat {} 2>/dev/null".format(shell_quote(path)), check=False)
+    return result.stdout.strip() if result.returncode == 0 and result.stdout.strip() else None
+
+
+def detect_hardware_platform(target):
+    result = target.shell("voxl-platform 2>/dev/null", check=False)
+    text = (result.stdout or result.stderr).strip()
+    if result.returncode != 0 or not text:
+        return None, text
+    match = re.search(r"\bM\d{4}\b", text)
+    return (match.group(0) if match else text.splitlines()[-1].strip()), text
+
+
+def installed_versions(target, platform_sku):
     hint = KNOWN_SKUS.get(platform_sku, {}).get("file_hint")
-    versions = []
-    for name in os.listdir(PARAM_ROOT):
-        path = os.path.join(PARAM_ROOT, name)
-        if not name.startswith("v") or not os.path.isdir(path):
-            continue
-        if hint and not os.path.exists(os.path.join(path, hint)):
-            continue
-        versions.append(name)
-    return sorted(versions, key=version_key)
+    condition = ""
+    if hint:
+        condition = "[ -f \"$d/{}\" ] || continue;".format(hint)
+    command = (
+        "for d in {root}/v*; do "
+        "[ -d \"$d\" ] || continue; "
+        "{condition} "
+        "basename \"$d\"; "
+        "done"
+    ).format(root=shell_quote(PARAM_ROOT), condition=condition)
+    result = target.shell(command, check=False)
+    versions = [line.strip() for line in result.stdout.splitlines() if line.strip().startswith("v")]
+    return sorted(set(versions), key=version_key)
 
 
-def choose_version(requested, platform_sku):
+def choose_version(target, requested, platform_sku):
     if requested != "auto":
         return requested
-    versions = installed_versions(platform_sku)
+    versions = installed_versions(target, platform_sku)
     if not versions:
         raise RuntimeError(
-            "could not find installed PX4 params for {} under {}".format(platform_sku, PARAM_ROOT)
+            "could not find installed PX4 params for {} under {} on {}".format(
+                platform_sku, PARAM_ROOT, target.label
+            )
         )
     return versions[-1]
 
 
-def detect_target(args):
-    raw_sku = read_first_line(args.sku_file)
+def detect_target_platform(target, args):
+    raw_sku = read_remote_file(target, args.sku_file)
     sku = normalize_sku(raw_sku)
-    hardware, hardware_raw = detect_hardware_platform()
+    hardware, hardware_raw = detect_hardware_platform(target)
 
     if args.platform:
-        target = args.platform
+        platform = args.platform
         source = "command line"
     elif sku:
-        target = sku
+        platform = sku
         source = args.sku_file
     elif hardware in HARDWARE_FALLBACK and not args.no_hardware_fallback:
-        target = HARDWARE_FALLBACK[hardware]
+        platform = HARDWARE_FALLBACK[hardware]
         source = "voxl-platform fallback for {}".format(hardware)
     else:
         raise RuntimeError(
-            "could not choose a PX4 param platform. Pass --platform MRB-D0012 or ensure {} exists.".format(
-                args.sku_file
+            "could not choose a PX4 param platform on {}. Pass --platform MRB-D0012 or ensure {} exists.".format(
+                target.label, args.sku_file
             )
         )
 
-    return target, source, raw_sku, hardware, hardware_raw
+    return platform, source, raw_sku, hardware, hardware_raw
 
 
-def confirm_or_exit(args, target, version, raw_sku, hardware, source):
-    info = KNOWN_SKUS.get(target, {})
+def confirm_or_exit(args, target, platform, version, raw_sku, hardware, source):
+    info = KNOWN_SKUS.get(platform, {})
     label = info.get("label", "unknown vehicle")
+    print("target: {}".format(target.label))
     print("detected hardware: {}".format(hardware or "unknown"))
     if raw_sku:
         print("detected SKU: {}".format(raw_sku))
     else:
         print("detected SKU: <none>")
-    print("selected params: {} ({}) from {}".format(target, label, source))
+    print("selected params: {} ({}) from {}".format(platform, label, source))
     print("params version: {}".format(version))
     if args.skip_cal:
         print("calibration restore: skipped")
     else:
         print("calibration restore: enabled")
 
-    if args.dry_run:
-        return
-    if args.yes:
+    if args.dry_run or args.yes:
         return
     answer = input("Apply these PX4 params now? [y/N] ").strip().lower()
     if answer not in ("y", "yes"):
         raise SystemExit("aborted")
 
 
-def build_command(args, target, version):
-    cmd = [
+def build_remote_command(args, platform, version):
+    parts = [
         args.configure,
         "-n",
         "-p",
-        target,
+        platform,
         "-v",
         version,
     ]
     if args.skip_cal:
-        cmd.append("--skip-cal")
+        parts.append("--skip-cal")
     if args.quiet:
-        cmd.append("--quiet")
-    return cmd
+        parts.append("--quiet")
+    return " ".join(shell_quote(part) for part in parts)
 
 
 def parse_args(argv):
     parser = argparse.ArgumentParser(
-        description="Apply ModalAI PX4 parameter defaults for the detected VOXL vehicle."
+        description="Apply ModalAI PX4 parameter defaults to a VOXL over adb, SSH, or locally."
     )
+    parser.add_argument(
+        "--transport",
+        choices=("auto", "adb", "ssh", "local"),
+        default="auto",
+        help="target transport; default: auto",
+    )
+    parser.add_argument("--adb", default="adb", help="adb executable path; default: adb")
+    parser.add_argument("-s", "--serial", help="adb serial when more than one device is connected")
+    parser.add_argument("--host", "--drone-ip", dest="host", help="VOXL IP/hostname for SSH mode")
+    parser.add_argument("--user", default=DEFAULT_REMOTE_USER, help="SSH username; default: root")
+    parser.add_argument(
+        "--password",
+        default=DEFAULT_REMOTE_PASSWORD,
+        help="SSH password for sshpass; use --password '' for SSH keys",
+    )
+    parser.add_argument("--ssh-port", type=int, default=22, help="SSH port; default: 22")
     parser.add_argument(
         "-p",
         "--platform",
@@ -198,12 +348,12 @@ def parse_args(argv):
     parser.add_argument(
         "--sku-file",
         default=SKU_PATH,
-        help="SKU file to read before falling back to voxl-platform; default: {}".format(SKU_PATH),
+        help="remote SKU file to read before falling back to voxl-platform; default: {}".format(SKU_PATH),
     )
     parser.add_argument(
         "--configure",
         default=DEFAULT_CONFIGURE,
-        help="voxl-configure-px4-params executable path; default: {}".format(DEFAULT_CONFIGURE),
+        help="remote voxl-configure-px4-params path; default: {}".format(DEFAULT_CONFIGURE),
     )
     parser.add_argument(
         "--skip-cal",
@@ -224,18 +374,19 @@ def parse_args(argv):
 def main(argv=None):
     args = parse_args(sys.argv[1:] if argv is None else argv)
     try:
-        target, source, raw_sku, hardware, hardware_raw = detect_target(args)
-        version = choose_version(args.version, target)
-        confirm_or_exit(args, target, version, raw_sku, hardware, source)
-        cmd = build_command(args, target, version)
-        print("command: {}".format(" ".join(cmd)))
+        target = choose_target(args)
+        platform, source, raw_sku, hardware, hardware_raw = detect_target_platform(target, args)
+        version = choose_version(target, args.version, platform)
+        confirm_or_exit(args, target, platform, version, raw_sku, hardware, source)
+        command = build_remote_command(args, platform, version)
+        print("remote command: {}".format(command))
         if args.dry_run:
             return 0
-        result = run(cmd, check=False)
+        result = target.shell(command, check=False)
         if result.stdout:
-            print(result.stdout, end="")
+            print(result.stdout, end="" if result.stdout.endswith("\n") else "\n")
         if result.stderr:
-            print(result.stderr, end="", file=sys.stderr)
+            print(result.stderr, end="" if result.stderr.endswith("\n") else "\n", file=sys.stderr)
         return result.returncode
     except RuntimeError as exc:
         print("ERROR: {}".format(exc), file=sys.stderr)
