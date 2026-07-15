@@ -2,12 +2,11 @@
 # /// script
 # requires-python = ">=3.10"
 # ///
-"""Pull Brecourt TFLite ROS logs from a VOXL/Starling over adb or SSH/SCP."""
+"""Pull VOXL/Starling ROS, terminal, and PX4 logs over adb or SSH/SCP."""
 
 from __future__ import annotations
 
 import argparse
-import datetime as dt
 import os
 import re
 import shutil
@@ -15,6 +14,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -33,6 +33,9 @@ DEFAULT_CONTAINER_LOG_DIRS = [
     "/root/brecourt/log/ros",
     "/root/.ros/log",
 ]
+DEFAULT_PX4_LOG_DIRS = [
+    "/data/px4/log",
+]
 STARLING_DISCOVERY_ROOTS = ["/data", "/home/root"]
 HOST_DISCOVERY_ROOTS = ["$HOME"]
 
@@ -49,6 +52,7 @@ class Args:
     starling_log_dirs: list[str] = field(default_factory=list)
     host_log_dirs: list[str] = field(default_factory=list)
     container_log_dirs: list[str] = field(default_factory=list)
+    px4_log_dirs: list[str] = field(default_factory=list)
 
 
 def run(
@@ -94,7 +98,7 @@ def label(value: str) -> str:
 
 def parse_args(argv: list[str]) -> Args:
     parser = argparse.ArgumentParser(
-        description="Pull Brecourt TFLite ROS 2 logs from a VOXL/Starling. Defaults to adb; use --scp for SSH/SCP.",
+        description="Pull VOXL/Starling ROS, terminal, and PX4 logs. Defaults to adb; use --scp for SSH/SCP.",
     )
     parser.add_argument("--serial", help="adb serial. Optional when exactly one adb device is attached.")
     parser.add_argument(
@@ -123,6 +127,8 @@ def parse_args(argv: list[str]) -> Args:
         help="Docker container ROS log dir. Repeatable.",
     )
     parser.add_argument("--no-discover", action="store_true", help="Do not search common remote roots for */brecourt/log/ros.")
+    parser.add_argument("--px4-log-dir", action="append", default=[], help="PX4 ULog root directory. Repeatable. Default: /data/px4/log")
+    parser.add_argument("--no-px4-logs", action="store_true", help="Do not pull PX4 ULog files.")
     ns = parser.parse_args(argv)
 
     starling_dirs = list(ns.starling_log_dir) or list(DEFAULT_STARLING_LOG_DIRS)
@@ -142,6 +148,7 @@ def parse_args(argv: list[str]) -> Args:
         starling_log_dirs=starling_dirs,
         host_log_dirs=host_dirs,
         container_log_dirs=ns.container_log_dir or list(DEFAULT_CONTAINER_LOG_DIRS),
+        px4_log_dirs=[] if ns.no_px4_logs else (ns.px4_log_dir or list(DEFAULT_PX4_LOG_DIRS)),
     )
 
 
@@ -184,8 +191,36 @@ class Remote:
     def copy_dir_to_local(self, remote_dir: str, local_dir: Path) -> None:
         raise NotImplementedError
 
+    def dir_size_bytes(self, remote_dir: str) -> int | None:
+        return self.dir_size_bytes_for_paths(remote_dir, None)
+
+    def dir_size_bytes_for_paths(self, remote_dir: str, relative_paths: list[str] | None) -> int | None:
+        if relative_paths is None:
+            result = self.shell(f"du -sk {shell_quote(remote_dir)} 2>/dev/null | awk '{{print $1}}'", check=False)
+        elif not relative_paths:
+            return 0
+        else:
+            quoted_paths = " ".join(shell_quote(path) for path in relative_paths)
+            result = self.shell(
+                f"cd {shell_quote(remote_dir)} && du -sk {quoted_paths} 2>/dev/null | awk '{{s += $1}} END {{print s}}'",
+                check=False,
+            )
+        if result.returncode != 0:
+            return None
+        text = result.stdout.strip().splitlines()
+        if not text or not text[-1].strip().isdigit():
+            return None
+        return int(text[-1].strip()) * 1024
+
     def copy_container_dir_to_local(self, container: str, remote_dir: str, local_dir: Path) -> bool:
         raise NotImplementedError
+
+    def read_first_existing_file(self, paths: list[str]) -> str | None:
+        for path in paths:
+            result = self.shell(f"cat {shell_quote(path)} 2>/dev/null", check=False)
+            if result.returncode == 0 and result.stdout.strip():
+                return result.stdout.strip().splitlines()[0].strip()
+        return None
 
 
 class AdbRemote(Remote):
@@ -246,10 +281,17 @@ class AdbRemote(Remote):
 
     def copy_dir_to_local(self, remote_dir: str, local_dir: Path) -> None:
         local_dir.mkdir(parents=True, exist_ok=True)
-        result = run_bytes(self.base + ["exec-out", f"tar -C {shell_quote(remote_dir)} -czf - ."], check=False)
-        if result.returncode != 0:
-            raise RuntimeError(result.stderr.decode(errors="replace").strip() or f"failed to tar {remote_dir}")
-        extract_tar_bytes(result.stdout, local_dir)
+        relative_paths = remote_paths_missing_locally(self, remote_dir, local_dir)
+        if relative_paths is not None and not relative_paths:
+            print(f"copy {remote_dir}: already up to date", file=sys.stderr)
+            return
+        tar_cmd = tar_command(remote_dir, relative_paths)
+        stream_tar_to_local(
+            self.base + ["exec-out", tar_cmd],
+            local_dir,
+            f"copy {remote_dir}",
+            self.dir_size_bytes_for_paths(remote_dir, relative_paths),
+        )
 
     def copy_container_dir_to_local(self, container: str, remote_dir: str, local_dir: Path) -> bool:
         tmp = f"/tmp/voxl_ros_logs_copy_{os.getpid()}"
@@ -300,10 +342,17 @@ class SshRemote(Remote):
 
     def copy_dir_to_local(self, remote_dir: str, local_dir: Path) -> None:
         local_dir.mkdir(parents=True, exist_ok=True)
-        result = run_bytes(["ssh", self.target, f"tar -C {shell_quote(remote_dir)} -czf - ."], check=False)
-        if result.returncode != 0:
-            raise RuntimeError(result.stderr.decode(errors="replace").strip() or f"failed to tar {remote_dir}")
-        extract_tar_bytes(result.stdout, local_dir)
+        relative_paths = remote_paths_missing_locally(self, remote_dir, local_dir)
+        if relative_paths is not None and not relative_paths:
+            print(f"copy {remote_dir}: already up to date", file=sys.stderr)
+            return
+        tar_cmd = tar_command(remote_dir, relative_paths)
+        stream_tar_to_local(
+            ["ssh", self.target, tar_cmd],
+            local_dir,
+            f"copy {remote_dir}",
+            self.dir_size_bytes_for_paths(remote_dir, relative_paths),
+        )
 
     def copy_container_dir_to_local(self, container: str, remote_dir: str, local_dir: Path) -> bool:
         tmp = f"/tmp/voxl_ros_logs_copy_{os.getpid()}"
@@ -350,6 +399,143 @@ def extract_tar_bytes(data: bytes, destination: Path) -> None:
         with tarfile.open(tmp.name, "r:gz") as tar:
             tar.extractall(destination)
     normalize_permissions(destination)
+
+
+def remote_paths_missing_locally(remote: Remote, remote_dir: str, local_dir: Path) -> list[str] | None:
+    if not any(local_dir.rglob("*")):
+        return None
+    result = remote.shell(
+        f"cd {shell_quote(remote_dir)} && find . -type f 2>/dev/null | "
+        "while IFS= read -r path; do rel=${path#./}; size=$(wc -c < \"$path\" 2>/dev/null) || continue; "
+        "printf '%s\\t%s\\n' \"$rel\" \"$size\"; done | sort",
+        check=False,
+    )
+    if result.returncode != 0:
+        return None
+    missing = []
+    for line in result.stdout.splitlines():
+        rel, sep, size_text = line.partition("\t")
+        if not sep or not rel or rel.startswith("/") or ".." in Path(rel).parts:
+            continue
+        local = local_dir / rel
+        try:
+            local_size = local.stat().st_size
+        except FileNotFoundError:
+            missing.append(rel)
+            continue
+        if not size_text.isdigit() or local_size != int(size_text):
+            missing.append(rel)
+    if len(missing) > 500 or sum(len(path) + 1 for path in missing) > 20000:
+        return None
+    return missing
+
+
+def tar_command(remote_dir: str, relative_paths: list[str] | None) -> str:
+    if relative_paths is None:
+        return f"tar -C {shell_quote(remote_dir)} -cf - ."
+    return f"cd {shell_quote(remote_dir)} && tar -cf - {' '.join(shell_quote(path) for path in relative_paths)}"
+
+
+def stream_tar_to_local(cmd: list[str], destination: Path, label_text: str, total_bytes: int | None) -> None:
+    destination.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(suffix=".tar") as tmp:
+        try:
+            process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        except FileNotFoundError as exc:
+            raise RuntimeError(f"{cmd[0]!r} was not found") from exc
+        assert process.stdout is not None
+        received = 0
+        last_render = 0.0
+        while True:
+            chunk = process.stdout.read(1024 * 1024)
+            if not chunk:
+                break
+            tmp.write(chunk)
+            received += len(chunk)
+            now = time.monotonic()
+            if now - last_render >= 0.2:
+                render_progress(label_text, received, total_bytes, done=False)
+                last_render = now
+        stderr = process.stderr.read().decode(errors="replace") if process.stderr else ""
+        rc = process.wait()
+        render_progress(label_text, received, total_bytes, done=True)
+        if rc != 0:
+            raise RuntimeError(stderr.strip() or f"tar stream failed for {label_text}")
+        tmp.flush()
+        tmp.seek(0)
+        with tarfile.open(tmp.name, "r:") as tar:
+            tar.extractall(destination)
+    normalize_permissions(destination)
+
+
+def render_progress(label_text: str, received: int, total: int | None, done: bool) -> None:
+    width = 24
+    if total and total > 0:
+        ratio = min(received / total, 1.0)
+        filled = int(ratio * width)
+        bar = "#" * filled + "-" * (width - filled)
+        text = f"\r{label_text}: [{bar}] {format_bytes(received)} / {format_bytes(total)} {ratio * 100:5.1f}%"
+    else:
+        text = f"\r{label_text}: {format_bytes(received)}"
+    end = "\n" if done else ""
+    print(text, end=end, file=sys.stderr, flush=True)
+
+
+def format_bytes(value: int) -> str:
+    amount = float(value)
+    for unit in ("B", "KB", "MB", "GB"):
+        if amount < 1024.0 or unit == "GB":
+            return f"{amount:.1f} {unit}"
+        amount /= 1024.0
+
+
+def detect_vehicle_id(remote: Remote) -> str:
+    hostname = remote.shell("hostname 2>/dev/null", check=False).stdout.strip().splitlines()
+    hostname = hostname[0].strip() if hostname else ""
+    machine_id = remote.read_first_existing_file(["/etc/machine-id", "/var/lib/dbus/machine-id"])
+    sku = remote.read_first_existing_file(["/data/modalai/sku.txt"])
+    hardware = detect_hardware_platform(remote)
+    mav_sys_id = read_px4_param(remote, "MAV_SYS_ID")
+
+    parts = []
+    if hostname:
+        parts.append(hostname)
+    if sku:
+        parts.append(normalize_token(sku))
+    elif hardware:
+        parts.append(hardware)
+    if mav_sys_id:
+        parts.append(f"sys{mav_sys_id}")
+    if machine_id:
+        parts.append(machine_id[:12])
+    if not parts:
+        parts.append("unknown_voxl")
+    return label("_".join(parts))
+
+
+def normalize_token(value: str) -> str:
+    return value.strip().split()[0]
+
+
+def detect_hardware_platform(remote: Remote) -> str | None:
+    result = remote.shell("voxl-platform 2>/dev/null", check=False)
+    text = (result.stdout or result.stderr).strip()
+    match = re.search(r"\bM\d{4}\b", text)
+    return match.group(0) if match else None
+
+
+def read_px4_param(remote: Remote, name: str) -> str | None:
+    result = remote.shell(f"px4-param show {shell_quote(name)} 2>/dev/null", check=False)
+    if result.returncode != 0:
+        return None
+    for line in result.stdout.splitlines():
+        if name not in line:
+            continue
+        _, _, value = line.partition(":")
+        value = value.strip()
+        if value:
+            return value.split()[0]
+    return None
 
 
 def normalize_permissions(path: Path) -> None:
@@ -426,23 +612,41 @@ def pull_docker_logs(remote: Remote, args: Args, dest: Path) -> bool:
     return False
 
 
+def pull_px4_logs(remote: Remote, args: Args, dest: Path) -> bool:
+    for path in expand_paths(remote, args.px4_log_dirs):
+        if remote.exists_nonempty_dir(path):
+            print(f"source=px4:{path}", file=sys.stderr)
+            remote.copy_dir_to_local(path, dest / "px4")
+            return True
+    return False
+
+
 def pull_logs(remote: Remote, args: Args, dest: Path) -> None:
     dest.mkdir(parents=True, exist_ok=True)
+    copied_ros_logs = False
+    ros_error = "no ROS logs found in Starling, host-user, or Docker paths"
     if args.source == "starling":
-        if not pull_named_dirs(remote, "starling", args.starling_log_dirs, STARLING_DISCOVERY_ROOTS, not args.no_discover, dest):
-            raise RuntimeError("no non-empty Starling ROS log directory found")
+        copied_ros_logs = pull_named_dirs(remote, "starling", args.starling_log_dirs, STARLING_DISCOVERY_ROOTS, not args.no_discover, dest)
+        ros_error = "no non-empty Starling ROS log directory found"
     elif args.source == "host":
-        if not pull_named_dirs(remote, "host", args.host_log_dirs, HOST_DISCOVERY_ROOTS, not args.no_discover, dest):
-            raise RuntimeError("no non-empty host-user ROS log directory found")
+        copied_ros_logs = pull_named_dirs(remote, "host", args.host_log_dirs, HOST_DISCOVERY_ROOTS, not args.no_discover, dest)
+        ros_error = "no non-empty host-user ROS log directory found"
     elif args.source == "docker":
-        if not pull_docker_logs(remote, args, dest):
-            raise RuntimeError("no non-empty ROS log directory found in Docker")
-    elif (
-        not pull_named_dirs(remote, "starling", args.starling_log_dirs, STARLING_DISCOVERY_ROOTS, not args.no_discover, dest)
-        and not pull_named_dirs(remote, "host", args.host_log_dirs, HOST_DISCOVERY_ROOTS, not args.no_discover, dest)
-        and not pull_docker_logs(remote, args, dest)
-    ):
-        raise RuntimeError("no ROS logs found in Starling, host-user, or Docker paths")
+        copied_ros_logs = pull_docker_logs(remote, args, dest)
+        ros_error = "no non-empty ROS log directory found in Docker"
+    else:
+        copied_ros_logs = (
+            pull_named_dirs(remote, "starling", args.starling_log_dirs, STARLING_DISCOVERY_ROOTS, not args.no_discover, dest)
+            or pull_named_dirs(remote, "host", args.host_log_dirs, HOST_DISCOVERY_ROOTS, not args.no_discover, dest)
+            or pull_docker_logs(remote, args, dest)
+        )
+    copied_px4_logs = pull_px4_logs(remote, args, dest)
+    if not copied_ros_logs and copied_px4_logs:
+        print(f"warning: {ros_error}", file=sys.stderr)
+    if args.px4_log_dirs and not copied_px4_logs:
+        print("warning: no non-empty PX4 log directory found", file=sys.stderr)
+    if not copied_ros_logs and not copied_px4_logs:
+        raise RuntimeError(ros_error)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -453,11 +657,11 @@ def main(argv: list[str] | None = None) -> int:
             target = label(remote.target)
         else:
             remote = AdbRemote(args.adb, args.serial)
-            target = f"adb_{label(remote.serial)}"
-        stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-        dest = args.output_dir / target / stamp
+        target = detect_vehicle_id(remote)
+        dest = args.output_dir / target
+        print(f"Output directory: {dest.resolve()}")
         pull_logs(remote, args, dest)
-        print(f"Copied ROS logs to: {dest}")
+        print(f"Copied logs to: {dest.resolve()}")
     except RuntimeError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
