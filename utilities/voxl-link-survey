@@ -1,0 +1,277 @@
+#!/usr/bin/env python3
+"""Survey VOXL LAN, SSH, and optional MAVLink UDP reachability over time."""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import datetime as dt
+import os
+import platform
+import re
+import select
+import shutil
+import socket
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+
+DEFAULT_USER = "root"
+DEFAULT_PORT = 22
+
+
+def run(cmd: list[str], timeout: float | None = None) -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=timeout)
+    except FileNotFoundError:
+        return subprocess.CompletedProcess(cmd, 127, "", f"{cmd[0]} not found")
+    except subprocess.TimeoutExpired as exc:
+        return subprocess.CompletedProcess(cmd, 124, exc.stdout or "", exc.stderr or "timeout")
+
+
+def ping_once(host: str, timeout: float) -> tuple[str, str]:
+    if platform.system() == "Darwin":
+        cmd = ["ping", "-c", "1", "-W", str(max(100, int(timeout * 1000))), host]
+    else:
+        cmd = ["ping", "-c", "1", "-W", str(max(1, int(round(timeout)))), host]
+    result = run(cmd, timeout=timeout + 1.0)
+    text = (result.stdout or "") + "\n" + (result.stderr or "")
+    match = re.search(r"time[=<]([0-9.]+)\s*ms", text)
+    if result.returncode == 0 and match:
+        return "ok", match.group(1)
+    if "No route to host" in text:
+        return "no_route", ""
+    if "Destination Host Unreachable" in text:
+        return "unreachable", ""
+    if "timeout" in text.lower() or "100.0% packet loss" in text:
+        return "timeout", ""
+    return "fail", ""
+
+
+def arp_entry(host: str) -> str:
+    if platform.system() == "Darwin":
+        result = run(["arp", "-n", host], timeout=1.0)
+        text = result.stdout or result.stderr
+        if "no entry" in text.lower():
+            return ""
+        match = re.search(r"\bat\s+([0-9a-f:]{11,17})\b", text, re.IGNORECASE)
+        return match.group(1).lower() if match else text.strip().replace(",", " ")
+
+    if shutil.which("ip"):
+        result = run(["ip", "neigh", "show", host], timeout=1.0)
+        text = result.stdout.strip()
+        match = re.search(r"\blladdr\s+([0-9a-f:]{11,17})\b", text, re.IGNORECASE)
+        state = text.split()[-1] if text else ""
+        if match:
+            return "{} {}".format(match.group(1).lower(), state)
+        return text
+
+    result = run(["arp", "-n", host], timeout=1.0)
+    return result.stdout.strip()
+
+
+def ssh_once(host: str, user: str, port: int, timeout: float) -> tuple[str, str]:
+    target = "{}@{}".format(user, host)
+    cmd = [
+        "ssh",
+        "-p",
+        str(port),
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "StrictHostKeyChecking=accept-new",
+        "-o",
+        "ConnectTimeout={}".format(max(1, int(round(timeout)))),
+        "-o",
+        "ServerAliveInterval=1",
+        "-o",
+        "ServerAliveCountMax=1",
+        target,
+        "printf 'up:%s load:%s\\n' \"$(cut -d. -f1 /proc/uptime 2>/dev/null)\" \"$(cut -d\\  -f1 /proc/loadavg 2>/dev/null)\"",
+    ]
+    result = run(cmd, timeout=timeout + 2.0)
+    if result.returncode == 0:
+        return "ok", result.stdout.strip()
+    detail = (result.stderr or result.stdout or "exit {}".format(result.returncode)).strip()
+    detail = " ".join(detail.split())
+    return "fail", detail[:140]
+
+
+def mavlink_summary(data: bytes) -> str:
+    if len(data) >= 10 and data[0] == 0xFD:
+        msgid = data[7] | (data[8] << 8) | (data[9] << 16)
+        return "v2 sys={} comp={} msg={}".format(data[5], data[6], msgid)
+    if len(data) >= 8 and data[0] == 0xFE:
+        return "v1 sys={} comp={} msg={}".format(data[3], data[4], data[5])
+    return "unknown len={}".format(len(data))
+
+
+class UdpMonitor:
+    def __init__(self, bind: str, port: int | None, source: str | None):
+        self.port = port
+        self.source = source
+        self.error = ""
+        self.count = 0
+        self.filtered_count = 0
+        self.last_src = ""
+        self.last_summary = ""
+        self.sock: socket.socket | None = None
+        if port is None:
+            return
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            if hasattr(socket, "SO_REUSEPORT"):
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+            sock.bind((bind, port))
+            sock.setblocking(False)
+        except OSError as exc:
+            self.error = str(exc)
+            return
+        self.sock = sock
+
+    def poll(self) -> tuple[int, int, str, str, str]:
+        if self.sock is None:
+            return 0, 0, "", "", self.error
+        new_count = 0
+        filtered_count = 0
+        while True:
+            readable, _, _ = select.select([self.sock], [], [], 0)
+            if not readable:
+                break
+            try:
+                data, src = self.sock.recvfrom(65535)
+            except BlockingIOError:
+                break
+            self.count += 1
+            if self.source and src[0] != self.source:
+                filtered_count += 1
+                self.filtered_count += 1
+                continue
+            new_count += 1
+            self.last_src = "{}:{}".format(src[0], src[1])
+            self.last_summary = mavlink_summary(data)
+        return new_count, filtered_count, self.last_src, self.last_summary, ""
+
+
+def positive_float(value: str) -> float:
+    parsed = float(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be positive")
+    return parsed
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Log repeated ping, ARP, optional SSH, gateway, and MAVLink UDP observations for a VOXL."
+    )
+    parser.add_argument("host", help="VOXL IP address or hostname")
+    parser.add_argument("--gateway", help="also ping this router/gateway IP")
+    parser.add_argument("--interval", type=positive_float, default=2.0, help="seconds between samples; default: 2")
+    parser.add_argument("--count", type=int, help="number of samples to collect")
+    parser.add_argument("--duration", type=positive_float, help="seconds to run; alternative to --count")
+    parser.add_argument("--ping-timeout", type=positive_float, default=1.0, help="per-ping timeout seconds; default: 1")
+    parser.add_argument("--ssh-check", action="store_true", help="attempt a short SSH command each sample")
+    parser.add_argument("--user", default=DEFAULT_USER, help="SSH user; default: root")
+    parser.add_argument("--ssh-port", type=int, default=DEFAULT_PORT, help="SSH port; default: 22")
+    parser.add_argument("--ssh-timeout", type=positive_float, default=2.0, help="SSH connect timeout seconds; default: 2")
+    parser.add_argument("--mavlink-port", type=int, help="listen for inbound MAVLink UDP on this local port, e.g. 14550")
+    parser.add_argument("--mavlink-bind", default="0.0.0.0", help="local UDP bind address; default: 0.0.0.0")
+    parser.add_argument("--mavlink-source", help="only count MAVLink UDP packets from this source IP")
+    parser.add_argument("--csv", type=Path, help="write CSV to this path in addition to stdout")
+    return parser.parse_args(argv)
+
+
+def should_continue(start: float, samples: int, args: argparse.Namespace) -> bool:
+    if args.count is not None and samples >= args.count:
+        return False
+    if args.duration is not None and time.monotonic() - start >= args.duration:
+        return False
+    return True
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(sys.argv[1:] if argv is None else argv)
+    udp = UdpMonitor(args.mavlink_bind, args.mavlink_port, args.mavlink_source)
+
+    fieldnames = [
+        "timestamp",
+        "target",
+        "ping",
+        "rtt_ms",
+        "arp",
+        "gateway",
+        "gateway_rtt_ms",
+        "ssh",
+        "ssh_detail",
+        "udp_new",
+        "udp_filtered",
+        "udp_last_src",
+        "udp_last_packet",
+        "udp_error",
+    ]
+
+    csv_file = None
+    csv_writer = None
+    if args.csv:
+        args.csv.parent.mkdir(parents=True, exist_ok=True)
+        csv_file = args.csv.open("w", newline="")
+        csv_writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+        csv_writer.writeheader()
+
+    stdout_writer = csv.DictWriter(sys.stdout, fieldnames=fieldnames)
+    stdout_writer.writeheader()
+
+    start = time.monotonic()
+    samples = 0
+    try:
+        while should_continue(start, samples, args):
+            loop_start = time.monotonic()
+            ping_status, rtt_ms = ping_once(args.host, args.ping_timeout)
+            arp = arp_entry(args.host)
+            gateway_status = ""
+            gateway_rtt = ""
+            if args.gateway:
+                gateway_status, gateway_rtt = ping_once(args.gateway, args.ping_timeout)
+            ssh_status = ""
+            ssh_detail = ""
+            if args.ssh_check:
+                ssh_status, ssh_detail = ssh_once(args.host, args.user, args.ssh_port, args.ssh_timeout)
+            udp_new, udp_filtered, udp_src, udp_packet, udp_error = udp.poll()
+            row = {
+                "timestamp": dt.datetime.now().isoformat(timespec="seconds"),
+                "target": args.host,
+                "ping": ping_status,
+                "rtt_ms": rtt_ms,
+                "arp": arp,
+                "gateway": gateway_status,
+                "gateway_rtt_ms": gateway_rtt,
+                "ssh": ssh_status,
+                "ssh_detail": ssh_detail,
+                "udp_new": udp_new,
+                "udp_filtered": udp_filtered,
+                "udp_last_src": udp_src,
+                "udp_last_packet": udp_packet,
+                "udp_error": udp_error,
+            }
+            stdout_writer.writerow(row)
+            sys.stdout.flush()
+            if csv_writer:
+                csv_writer.writerow(row)
+                csv_file.flush()
+            samples += 1
+            sleep_for = args.interval - (time.monotonic() - loop_start)
+            if sleep_for > 0:
+                time.sleep(sleep_for)
+    except KeyboardInterrupt:
+        return 130
+    finally:
+        if csv_file:
+            csv_file.close()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
